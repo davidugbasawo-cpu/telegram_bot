@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 APP_ID       = 1089
 DEMO_TOKEN   = "tIrfitLjqeBxCOM"
 REAL_TOKEN   = "ZkOFWOlPtwnjqTS"
-TELEGRAM_TOKEN = "8589420556:AAHmB6YE9KIEu0tBIgWdd9baBDt0eDh5FY8"
+TELEGRAM_TOKEN = "8697638086:AAG00D0RXUAqXFTjy8-4XO4Bka2kBamo-VA:"
 
 # ===== MARKETS =====
 MARKETS = ["frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxGBPJPY"]

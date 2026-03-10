@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 APP_ID       = 1089
 DEMO_TOKEN   = "tIrfitLjqeBxCOM"
 REAL_TOKEN   = "ZkOFWOlPtwnjqTS"
-TELEGRAM_TOKEN = "8697638086:AAG00D0RXUAqXFTjy8-4XO4Bka2kBamo-VA"
+TELEGRAM_TOKEN = "8589420556:AAHmB6YE9KIEu0tBIgWdd9baBDt0eDh5FY8"
 
 # ===== MARKETS =====
 MARKETS = ["frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxGBPJPY"]
@@ -390,23 +390,37 @@ class StructureBreakBot:
         return by_mkt, by_sess, wr
 
     async def connect(self):
-        try:
-            token = DEMO_TOKEN if self.account_type == "DEMO" else REAL_TOKEN
-            if self.api:
-                try: await self.api.disconnect()
-                except: pass
-            self.api = DerivAPI(app_id=APP_ID)
-            await self.api.authorize(token)
-            await self.fetch_balance()
+        for attempt in range(3):
             try:
-                bal_val = float(str(self.balance).split()[0])
-                if self.starting_balance == 0.0: self.starting_balance = bal_val
-            except: pass
-            logger.info(f"Connected — {self.account_type} | {self.balance}")
+                token = DEMO_TOKEN if self.account_type == "DEMO" else REAL_TOKEN
+                # Always destroy old connection first
+                if self.api:
+                    try: await self.api.disconnect()
+                    except: pass
+                    self.api = None
+                await asyncio.sleep(1)
+                self.api = DerivAPI(app_id=APP_ID)
+                await asyncio.wait_for(self.api.authorize(token), timeout=15.0)
+                await self.fetch_balance()
+                try:
+                    bal_val = float(str(self.balance).split()[0])
+                    if self.starting_balance == 0.0: self.starting_balance = bal_val
+                except: pass
+                logger.info(f"Connected — {self.account_type} | {self.balance}")
+                return True
+            except Exception as e:
+                logger.error(f"Connect error attempt {attempt+1}: {e}")
+                self.api = None
+                await asyncio.sleep(3 * (attempt + 1))
+        return False
+
+    async def ping(self):
+        """Check if connection is alive"""
+        if not self.api: return False
+        try:
+            await asyncio.wait_for(self.api.ping({"ping": 1}), timeout=5.0)
             return True
-        except Exception as e:
-            logger.error(f"Connect error: {e}")
-            self.api = None
+        except:
             return False
 
     async def fetch_balance(self):
@@ -443,16 +457,37 @@ class StructureBreakBot:
             logger.warning(f"TG send failed: {e}")
 
     async def fetch_candles_with_timeout(self, symbol, tf_sec, count):
-        try:
-            res = await asyncio.wait_for(
-                self.safe_deriv_call("ticks_history", {
-                    "ticks_history": symbol, "style": "candles",
-                    "granularity": tf_sec, "count": count, "end": "latest"
-                }), timeout=15.0)
-            return build_candles_from_deriv(res.get("candles", []))
-        except Exception as e:
-            logger.warning(f"Candles failed {symbol} tf={tf_sec}: {e}")
-            return []
+        for attempt in range(4):
+            try:
+                # Ping first — if connection is stale, reconnect before fetching
+                alive = await self.ping()
+                if not alive:
+                    logger.warning(f"Connection dead (attempt {attempt+1}) — reconnecting")
+                    connected = await self.connect()
+                    if not connected:
+                        await asyncio.sleep(3)
+                        continue
+                    await asyncio.sleep(1)
+                res = await asyncio.wait_for(
+                    self.api.ticks_history({
+                        "ticks_history": symbol, "style": "candles",
+                        "granularity": tf_sec, "count": count, "end": "latest"
+                    }), timeout=20.0)
+                candles = build_candles_from_deriv(res.get("candles", []))
+                if candles:
+                    return candles
+                logger.warning(f"Empty candles {symbol} attempt {attempt+1}")
+                await asyncio.sleep(2)
+            except asyncio.TimeoutError:
+                logger.warning(f"Candle fetch timeout {symbol} attempt {attempt+1} — reconnecting")
+                self.api = None
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.warning(f"Candles failed {symbol} attempt {attempt+1}: {e}")
+                self.api = None
+                await asyncio.sleep(3 * (attempt + 1))
+        logger.error(f"fetch_candles failed after 4 attempts: {symbol}")
+        return []
 
     async def execute_trade(self, side, symbol, **kwargs):
         _, _, stake_mult = self._equity_ok()
@@ -718,9 +753,23 @@ class StructureBreakBot:
                 logger.error(f"Scan error {symbol}: {e}")
                 await asyncio.sleep(10)
 
+    async def _connection_watchdog(self):
+        """Ping every 60s — reconnect immediately if connection is dead"""
+        while True:
+            await asyncio.sleep(60)
+            try:
+                if self.api:
+                    alive = await self.ping()
+                    if not alive:
+                        logger.warning("Watchdog: connection dead — reconnecting")
+                        await self.connect()
+            except Exception as e:
+                logger.error(f"Watchdog error: {e}")
+
     async def run(self):
         """Simple keepalive — connect and scan controlled by Telegram buttons"""
         logger.info("Bot started — press DEMO or LIVE in Telegram to connect, then START to scan")
+        asyncio.create_task(self._connection_watchdog())
         while True:
             await asyncio.sleep(60)
 

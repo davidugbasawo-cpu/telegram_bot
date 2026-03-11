@@ -731,6 +731,32 @@ class StructureBreakBot:
                         "why": [f"Warming up 15M:{len(candles_15m)} 5M:{len(candles_5m)} 1M:{len(candles_1m)}"]}
                     continue
 
+                # Stale data check — if latest 1M candle is > 3 min old, connection is frozen
+                if candles_1m:
+                    latest_epoch = candles_1m[-1].get("epoch", 0)
+                    stale = latest_epoch > 0 and (time.time() - latest_epoch) > 180
+                    last_recon = self._last_stale_reconnect.get(symbol, 0)
+                    if stale and (time.time() - last_recon) > 60:
+                        age = int(time.time() - latest_epoch)
+                        logger.warning(f"Stale {symbol} — {age}s old, forcing full reconnect")
+                        self._last_stale_reconnect[symbol] = time.time()
+                        self.market_debug[symbol] = {"time": time.time(), "gate": gate,
+                            "why": [f"Stale data ({age}s) — reconnecting..."]}
+                        try:
+                            if self.api: await self.api.disconnect()
+                        except: pass
+                        self.api = None
+                        await asyncio.sleep(2)
+                        await self.connect()
+                        await asyncio.sleep(3)
+                        continue
+                    elif stale:
+                        # Already reconnected recently, just skip this cycle
+                        self.market_debug[symbol] = {"time": time.time(), "gate": gate,
+                            "why": [f"Stale data — waiting for fresh candles"]}
+                        await asyncio.sleep(5)
+                        continue
+
                 # Confirmed closed candles only (drop last open candle)
                 c15 = candles_15m[:-1]
                 c5  = candles_5m[:-1]

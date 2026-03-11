@@ -393,7 +393,8 @@ class StructureBreakBot:
 
         # debug
         self.market_debug = {}
-        self.last_processed_m5_t0 = {}
+        self.last_processed_m5_t0     = {}
+        self._last_stale_reconnect    = {s: 0.0 for s in MARKETS}
 
         # trade history
         self.trade_history = []

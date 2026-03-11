@@ -1,12 +1,11 @@
 """
 Deriv Forex Binary Options Bot
-Strategy: 1-Minute Bollinger Band Pullback
+Strategy: 3-Timeframe Pullback System
+  15M → trend direction  (EMA50 > EMA200 = uptrend)
+  5M  → pullback quality (EMA20 touch + EMA50 slope + RSI + spread)
+  1M  → entry trigger    (engulfing/rejection + close vs EMA20 + body + spike)
 Markets: EURUSD, GBPUSD, USDJPY, AUDUSD, GBPJPY
-
-Entry Logic:
-CALL: Price above EMA100 + price touches lower BB + Stochastic < 20 crossing up + bullish candle
-PUT:  Price below EMA100 + price touches upper BB + Stochastic > 80 crossing down + bearish candle
-Expiry: 2 minutes | Stop after 5 consecutive losses
+Expiry: 2 minutes
 """
 
 import asyncio, time, logging, json, os
@@ -38,17 +37,33 @@ MAX_CONSEC_LOSSES       = 5      # global stop
 COOLDOWN_SEC            = 180    # 3 min after every trade
 
 # ===== STRATEGY =====
-TF_M1_SEC           = 60         # M1 only
-CANDLES_M1          = 120        # enough for EMA100 + BB + RSI
+TF_15M_SEC          = 900        # 15M candles — trend direction
+TF_5M_SEC           = 300        # 5M candles  — pullback quality
+TF_M1_SEC           = 60         # 1M candles  — entry trigger
+CANDLES_15M         = 250        # enough for EMA200
+CANDLES_5M          = 150        # enough for EMA50 slope + RSI + ATR
+CANDLES_M1          = 60         # enough for pattern + body detection
 EXPIRY_MIN          = 2          # 2 min expiry
-EMA_PERIOD          = 100        # EMA100 trend filter
-BB_PERIOD           = 20         # Bollinger Bands period
-BB_STD              = 2.0        # Bollinger Bands standard deviation
-STOCH_K_PERIOD      = 9          # Stochastic %K period (9 = smoother on M1)
-STOCH_D_PERIOD      = 3          # Stochastic %D smoothing
-STOCH_OVERSOLD      = 20         # %K below this = oversold = CALL zone
-STOCH_OVERBOUGHT    = 80         # %K above this = overbought = PUT zone
-BODY_RATIO_MIN      = 0.40       # minimum body ratio for confirmation candle
+
+# 15M indicators
+EMA_TREND_FAST      = 50         # EMA50  — fast trend
+EMA_TREND_SLOW      = 200        # EMA200 — slow trend
+EMA_15M_ATR_MULT    = 0.5        # min distance price vs EMA50 on 15M
+
+# 5M indicators
+EMA_PULLBACK        = 20         # EMA20  — pullback level
+EMA_5M_SLOW         = 50         # EMA50  — 5M trend confirmation
+EMA_SLOPE_LOOKBACK  = 10         # candles back for EMA50 slope
+RSI_PERIOD          = 14         # RSI period
+RSI_MIN             = 40         # RSI lower bound (both directions)
+RSI_MAX             = 60         # RSI upper bound (both directions)
+ATR_PERIOD          = 14         # ATR for spread filter
+EMA_SPREAD_ATR_MULT = 0.2        # min EMA20/EMA50 spread vs ATR
+
+# 1M indicators
+BODY_RATIO_MIN      = 0.32       # minimum body ratio — no dojis
+SPIKE_MULT          = 1.5        # body > SPIKE_MULT * avg = spike block
+SPIKE_LOOKBACK      = 20         # candles for average body calculation
 
 # Weekend block only — trading all sessions to collect data
 FOREX_WEEKEND_BLOCK = False  # trading all days including weekends
@@ -212,6 +227,88 @@ def body_ratio(open_, close, high, low):
     candle_range = abs(high - low)
     if candle_range == 0: return 0
     return abs(close - open_) / candle_range
+
+def is_engulfing_bullish(prev, cur):
+    """Current green candle fully engulfs previous red candle"""
+    if prev["close"] >= prev["open"]: return False   # prev must be bearish
+    if cur["close"] <= cur["open"]:   return False   # cur must be bullish
+    return cur["close"] >= prev["open"] and cur["open"] <= prev["close"]
+
+def is_engulfing_bearish(prev, cur):
+    """Current red candle fully engulfs previous green candle"""
+    if prev["close"] <= prev["open"]: return False   # prev must be bullish
+    if cur["close"] >= cur["open"]:   return False   # cur must be bearish
+    return cur["close"] <= prev["open"] and cur["open"] >= prev["close"]
+
+def is_rejection_bullish(candle):
+    """Hammer: long lower wick, small body, closes green"""
+    o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
+    rng = max(1e-10, h - l)
+    body = abs(c - o)
+    lower_wick = min(o, c) - l
+    upper_wick = h - max(o, c)
+    return (lower_wick / rng) >= 0.45 and (body / rng) <= 0.55 and c >= o
+
+def is_rejection_bearish(candle):
+    """Shooting star: long upper wick, small body, closes red"""
+    o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
+    rng = max(1e-10, h - l)
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    return (upper_wick / rng) >= 0.45 and (body / rng) <= 0.55 and c <= o
+
+def calc_ema_value(closes, period):
+    """Returns single EMA value for last candle"""
+    closes = [float(c) for c in closes]
+    if len(closes) < period: return None
+    k = 2.0 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for c in closes[period:]:
+        ema = c * k + ema * (1 - k)
+    return ema
+
+def calc_ema_series_full(closes, period):
+    """Returns full EMA series as list"""
+    closes = [float(c) for c in closes]
+    if len(closes) < period: return []
+    k = 2.0 / (period + 1)
+    ema = sum(closes[:period]) / period
+    result = [None] * period + [ema]
+    for c in closes[period:]:
+        ema = c * k + ema * (1 - k)
+        result.append(ema)
+    return result
+
+def calc_rsi(closes, period=14):
+    """Returns single RSI value"""
+    closes = [float(c) for c in closes]
+    if len(closes) < period + 2: return None
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains  = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
+    avg_g  = sum(gains[:period]) / period
+    avg_l  = sum(losses[:period]) / period
+    for i in range(period, len(deltas)):
+        avg_g = (avg_g * (period - 1) + gains[i])  / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+    if avg_l == 0: return 100.0
+    return 100.0 - (100.0 / (1.0 + avg_g / avg_l))
+
+def calc_atr(highs, lows, closes, period=14):
+    """Returns single ATR value"""
+    if len(closes) < period + 2: return None
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i-1]),
+                 abs(lows[i]  - closes[i-1]))
+        trs.append(tr)
+    if len(trs) < period: return None
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
 
 def is_forex_market_open():
     now_utc = datetime.now(ZoneInfo("UTC"))
@@ -525,9 +622,9 @@ class StructureBreakBot:
                 f"Step: {self.martingale_step}/{MARTINGALE_MAX_STEPS}\n"
                 f"Expiry: {EXPIRY_MIN}m\n"
                 f"Session: {session_bucket(time.time())}\n"
-                f"Stoch %K: {kwargs.get('stoch','?')}\n"
-                f"BB level: {kwargs.get('bb','?')}\n"
-                f"EMA100: {kwargs.get('ema','?')}"
+                f"Pattern: {kwargs.get('pattern','?')}\n"
+                f"5M EMA20: {kwargs.get('ema20','?')}\n"
+                f"RSI: {kwargs.get('rsi','?')} | Trend: {kwargs.get('trend','?')}"
             )
             # wait for result
             await asyncio.sleep(EXPIRY_MIN * 60 + 10)
@@ -618,122 +715,238 @@ class StructureBreakBot:
                 ok_gate, gate = self.can_auto_trade()
                 mkt_ok, mkt_msg = self._is_market_available(symbol)
 
-                # ── FETCH M1 CANDLES ─────────────────────────────────
-                candles_m1 = await self.fetch_candles_with_timeout(
-                    symbol, TF_M1_SEC, CANDLES_M1)
+                # ── FETCH ALL 3 TIMEFRAMES ───────────────────────────
+                tf15_task = asyncio.create_task(
+                    self.fetch_candles_with_timeout(symbol, TF_15M_SEC, CANDLES_15M))
+                tf5_task  = asyncio.create_task(
+                    self.fetch_candles_with_timeout(symbol, TF_5M_SEC,  CANDLES_5M))
+                tf1_task  = asyncio.create_task(
+                    self.fetch_candles_with_timeout(symbol, TF_M1_SEC,  CANDLES_M1))
+                candles_15m, candles_5m, candles_1m = await asyncio.gather(
+                    tf15_task, tf5_task, tf1_task)
 
-                if len(candles_m1) < EMA_PERIOD + 10:
+                # Need enough candles for all indicators
+                if len(candles_15m) < EMA_TREND_SLOW + 10:
                     self.market_debug[symbol] = {"time": time.time(), "gate": gate,
-                        "why": [f"Warming up — {len(candles_m1)} M1 candles"]}
+                        "why": [f"Warming up 15M:{len(candles_15m)} 5M:{len(candles_5m)} 1M:{len(candles_1m)}"]}
                     continue
 
-                # Use confirmed closed candles only
-                m1_confirmed = candles_m1[:-1] if len(candles_m1) > 1 else []
-                if len(m1_confirmed) < EMA_PERIOD + 5:
-                    continue
+                # Confirmed closed candles only (drop last open candle)
+                c15 = candles_15m[:-1]
+                c5  = candles_5m[:-1]
+                c1  = candles_1m[:-1]
 
-                # ── M1 OHLC ──────────────────────────────────────────
-                m1_closes = [c["close"] for c in m1_confirmed]
-                m1_highs  = [c["high"]  for c in m1_confirmed]
-                m1_lows   = [c["low"]   for c in m1_confirmed]
-                m1_opens  = [c["open"]  for c in m1_confirmed]
+                if len(c15) < EMA_TREND_SLOW + 5: continue
+                if len(c5)  < EMA_5M_SLOW + EMA_SLOPE_LOOKBACK + 5: continue
+                if len(c1)  < SPIKE_LOOKBACK + 3: continue
 
-                # ── INDICATORS ────────────────────────────────────────
-                ema100      = calculate_ema100(m1_closes, EMA_PERIOD)
-                bb_upper, bb_mid, bb_lower = calculate_bollinger_bands(
-                    m1_closes, BB_PERIOD, BB_STD)
-                stoch_k, stoch_k_prev, stoch_d = calculate_stochastic(
-                    m1_highs, m1_lows, m1_closes, STOCH_K_PERIOD, STOCH_D_PERIOD)
+                # ── 15M INDICATORS ────────────────────────────────────
+                cl15 = [c["close"] for c in c15]
+                hi15 = [c["high"]  for c in c15]
+                lo15 = [c["low"]   for c in c15]
 
-                if any(v is None for v in [ema100, bb_upper, bb_lower,
-                                           stoch_k, stoch_k_prev]):
+                ema50_15  = calc_ema_value(cl15, EMA_TREND_FAST)
+                ema200_15 = calc_ema_value(cl15, EMA_TREND_SLOW)
+                atr15     = calc_atr(hi15, lo15, cl15, ATR_PERIOD)
+                price_15  = cl15[-1]
+
+                if any(v is None for v in [ema50_15, ema200_15, atr15]):
                     self.market_debug[symbol] = {"time": time.time(), "gate": gate,
-                        "why": ["Indicators warming up"]}
+                        "why": ["15M indicators warming up"]}
                     continue
 
-                # ── LAST TWO CANDLES ──────────────────────────────────
-                cur  = m1_confirmed[-1]   # signal candle
-                cur_close = cur["close"]
-                cur_open  = cur["open"]
-                cur_high  = cur["high"]
-                cur_low   = cur["low"]
+                # 15M trend
+                trend_up   = (ema50_15 > ema200_15
+                              and price_15 > ema50_15
+                              and price_15 > ema200_15
+                              and (price_15 - ema50_15) >= EMA_15M_ATR_MULT * atr15)
+                trend_down = (ema50_15 < ema200_15
+                              and price_15 < ema50_15
+                              and price_15 < ema200_15
+                              and (ema50_15 - price_15) >= EMA_15M_ATR_MULT * atr15)
 
-                # ── TREND FILTER (EMA100) ─────────────────────────────
-                above_ema = cur_close > ema100   # uptrend
-                below_ema = cur_close < ema100   # downtrend
+                if not trend_up and not trend_down:
+                    trend_label = "SIDEWAYS" if abs(ema50_15 - ema200_15) < atr15 * 0.5 else "WEAK"
+                    self.market_debug[symbol] = {"time": time.time(), "gate": gate,
+                        "why": [f"15M: {trend_label} — EMA50:{ema50_15:.5f} EMA200:{ema200_15:.5f}"]}
+                    continue
 
-                # ── BOLLINGER BAND TOUCH ──────────────────────────────
-                # Touch = candle low pierces or touches lower band (CALL)
-                # Touch = candle high pierces or touches upper band (PUT)
-                # Low must pierce band but close must bounce back inside — genuine rejection
-                touches_lower_bb = cur_low <= bb_lower and cur_close > bb_lower
-                touches_upper_bb = cur_high >= bb_upper and cur_close < bb_upper
+                # ── 5M INDICATORS ─────────────────────────────────────
+                cl5 = [c["close"] for c in c5]
+                hi5 = [c["high"]  for c in c5]
+                lo5 = [c["low"]   for c in c5]
 
-                # ── STOCHASTIC CONDITIONS ────────────────────────────
-                stoch_oversold   = stoch_k < STOCH_OVERSOLD   and stoch_k > stoch_k_prev  # < 20 crossing up
-                stoch_overbought = stoch_k > STOCH_OVERBOUGHT and stoch_k < stoch_k_prev  # > 80 crossing down
+                ema20_series = calc_ema_series_full(cl5, EMA_PULLBACK)
+                ema50_series = calc_ema_series_full(cl5, EMA_5M_SLOW)
+                rsi5         = calc_rsi(cl5, RSI_PERIOD)
+                atr5         = calc_atr(hi5, lo5, cl5, ATR_PERIOD)
 
-                # ── CANDLE CONFIRMATION ───────────────────────────────
-                # Must be bullish/bearish AND have meaningful body (no dojis)
-                _body = body_ratio(cur_open, cur_close, cur_high, cur_low)
-                candle_bullish = cur_close > cur_open and _body >= BODY_RATIO_MIN
-                candle_bearish = cur_close < cur_open and _body >= BODY_RATIO_MIN
+                if (not ema20_series or not ema50_series
+                        or rsi5 is None or atr5 is None):
+                    self.market_debug[symbol] = {"time": time.time(), "gate": gate,
+                        "why": ["5M indicators warming up"]}
+                    continue
 
-                # ── SIGNAL ────────────────────────────────────────────
+                ema20_5  = ema20_series[-1]
+                ema50_5  = ema50_series[-1]
+
+                # EMA50 slope — compare now vs N candles ago
+                slope_idx = -(EMA_SLOPE_LOOKBACK + 1)
+                if abs(slope_idx) > len(ema50_series):
+                    self.market_debug[symbol] = {"time": time.time(), "gate": gate,
+                        "why": ["5M slope not ready"]}
+                    continue
+                ema50_slope   = ema50_5 - ema50_series[slope_idx]
+                slope_rising  = ema50_slope >  0
+                slope_falling = ema50_slope <  0
+
+                # EMA spread filter — avoid flat ranging conditions
+                ema_spread = abs(ema20_5 - ema50_5)
+                spread_ok  = ema_spread >= EMA_SPREAD_ATR_MULT * atr5
+
+                # RSI filter
+                rsi_ok = RSI_MIN <= rsi5 <= RSI_MAX
+
+                # 5M pullback touch — last confirmed 5M candle
+                pb = c5[-1]
+                pb_touched_ema20_bull = pb["low"]  <= ema20_series[-1]   # low touched EMA20
+                pb_touched_ema20_bear = pb["high"] >= ema20_series[-1]   # high touched EMA20
+
+                # 5M close must stay on trend side of EMA50 (no deep break)
+                pb_close_above_ema50 = pb["close"] > ema50_5
+                pb_close_below_ema50 = pb["close"] < ema50_5
+
+                # ── 1M ENTRY TRIGGER ──────────────────────────────────
+                if len(c1) < 3:
+                    continue
+
+                cl1 = [c["close"] for c in c1]
+                hi1 = [c["high"]  for c in c1]
+                lo1 = [c["low"]   for c in c1]
+
+                prev1 = c1[-2]   # previous 1M candle
+                cur1  = c1[-1]   # latest closed 1M candle
+
+                # Pattern detection
+                bull_engulf   = is_engulfing_bullish(prev1, cur1)
+                bear_engulf   = is_engulfing_bearish(prev1, cur1)
+                bull_reject   = is_rejection_bullish(cur1)
+                bear_reject   = is_rejection_bearish(cur1)
+
+                bull_pattern  = bull_engulf or bull_reject
+                bear_pattern  = bear_engulf or bear_reject
+
+                # 1M close must be back on correct side of 5M EMA20
+                cur_close = cur1["close"]
+                close_above_ema20 = cur_close > ema20_5
+                close_below_ema20 = cur_close < ema20_5
+
+                # Body ratio filter — no dojis
+                _body = body_ratio(cur1["open"], cur1["close"], cur1["high"], cur1["low"])
+                body_ok = _body >= BODY_RATIO_MIN
+
+                # Spike block — no news candles
+                bodies = [abs(c["close"] - c["open"]) for c in c1[-(SPIKE_LOOKBACK+2):-2]]
+                avg_body  = sum(bodies) / len(bodies) if bodies else 0
+                last_body = abs(cur1["close"] - cur1["open"])
+                spike_ok  = not (avg_body > 0 and last_body > SPIKE_MULT * avg_body)
+
+                # ── FULL SIGNAL LOGIC ─────────────────────────────────
                 signal = None
                 reason = "Scanning..."
 
-                call_setup = (
-                    above_ema        and   # uptrend
-                    touches_lower_bb and   # price at lower band
-                    stoch_oversold   and   # Stochastic < 20 crossing up
-                    candle_bullish         # bullish confirmation candle
+                call_ready = (
+                    trend_up              and   # 15M uptrend
+                    slope_rising          and   # 5M EMA50 momentum rising
+                    spread_ok             and   # 5M not flat/ranging
+                    pb_touched_ema20_bull and   # 5M pulled back to EMA20
+                    pb_close_above_ema50  and   # 5M didn't break through EMA50
+                    rsi_ok                and   # RSI healthy
+                    bull_pattern          and   # 1M engulfing or rejection
+                    close_above_ema20     and   # 1M close back above EMA20
+                    body_ok               and   # 1M meaningful body
+                    spike_ok                    # not a spike candle
                 )
-                put_setup = (
-                    below_ema        and   # downtrend
-                    touches_upper_bb and   # price at upper band
-                    stoch_overbought and   # Stochastic > 80 crossing down
-                    candle_bearish         # bearish confirmation candle
+                put_ready = (
+                    trend_down            and   # 15M downtrend
+                    slope_falling         and   # 5M EMA50 momentum falling
+                    spread_ok             and   # 5M not flat/ranging
+                    pb_touched_ema20_bear and   # 5M pulled back to EMA20
+                    pb_close_below_ema50  and   # 5M didn't break through EMA50
+                    rsi_ok                and   # RSI healthy
+                    bear_pattern          and   # 1M engulfing or rejection
+                    close_below_ema20     and   # 1M close back below EMA20
+                    body_ok               and   # 1M meaningful body
+                    spike_ok                    # not a spike candle
                 )
 
-                if call_setup:
+                trend_label = "UPTREND" if trend_up else "DOWNTREND"
+
+                if call_ready:
                     signal = "CALL"
-                    reason = f"CALL: Above EMA100({ema100:.5f}) | Lower BB touch({bb_lower:.5f}) | Stoch {stoch_k:.1f} crossing up | Bullish candle"
-                elif put_setup:
+                    reason = (f"CALL: 15M {trend_label} | 5M slope rising | "
+                              f"Pullback EMA20({ema20_5:.5f}) | RSI {rsi5:.1f} | "
+                              f"{'Engulf' if bull_engulf else 'Reject'} | Close>{ema20_5:.5f}")
+                elif put_ready:
                     signal = "PUT"
-                    reason = f"PUT: Below EMA100({ema100:.5f}) | Upper BB touch({bb_upper:.5f}) | Stoch {stoch_k:.1f} crossing down | Bearish candle"
+                    reason = (f"PUT: 15M {trend_label} | 5M slope falling | "
+                              f"Pullback EMA20({ema20_5:.5f}) | RSI {rsi5:.1f} | "
+                              f"{'Engulf' if bear_engulf else 'Reject'} | Close<{ema20_5:.5f}")
                 else:
-                    # Show what's missing
-                    parts = []
-                    if not above_ema and not below_ema:
-                        parts.append("Price at EMA100 — no trend")
-                    elif above_ema and not touches_lower_bb:
-                        parts.append(f"Uptrend — waiting for lower BB touch (BB:{bb_lower:.5f} Low:{cur_low:.5f})")
-                    elif below_ema and not touches_upper_bb:
-                        parts.append(f"Downtrend — waiting for upper BB touch (BB:{bb_upper:.5f} High:{cur_high:.5f})")
-                    elif not stoch_oversold and not stoch_overbought:
-                        parts.append(f"Stoch neutral ({stoch_k:.1f}) — need <{STOCH_OVERSOLD} or >{STOCH_OVERBOUGHT}")
-                    reason = parts[0] if parts else f"No setup — Stoch:{stoch_k:.1f} EMA:{ema100:.5f}"
+                    # Detailed reason for what's missing
+                    if not spread_ok:
+                        reason = f"5M ranging — EMA spread {ema_spread:.5f} < min {EMA_SPREAD_ATR_MULT*atr5:.5f}"
+                    elif not slope_rising and trend_up:
+                        reason = f"5M EMA50 slope flat/falling ({ema50_slope:.5f}) — waiting for momentum"
+                    elif not slope_falling and trend_down:
+                        reason = f"5M EMA50 slope flat/rising ({ema50_slope:.5f}) — waiting for momentum"
+                    elif trend_up and not pb_touched_ema20_bull:
+                        reason = f"Waiting 5M pullback to EMA20 ({ema20_5:.5f}) — price {cl5[-1]:.5f}"
+                    elif trend_down and not pb_touched_ema20_bear:
+                        reason = f"Waiting 5M pullback to EMA20 ({ema20_5:.5f}) — price {cl5[-1]:.5f}"
+                    elif not rsi_ok:
+                        reason = f"RSI {rsi5:.1f} outside {RSI_MIN}–{RSI_MAX}"
+                    elif not bull_pattern and trend_up:
+                        reason = "Waiting 1M bullish engulfing or rejection"
+                    elif not bear_pattern and trend_down:
+                        reason = "Waiting 1M bearish engulfing or rejection"
+                    elif trend_up and not close_above_ema20:
+                        reason = f"1M close {cur_close:.5f} not above EMA20 {ema20_5:.5f}"
+                    elif trend_down and not close_below_ema20:
+                        reason = f"1M close {cur_close:.5f} not below EMA20 {ema20_5:.5f}"
+                    elif not body_ok:
+                        reason = f"1M weak body {_body:.2f} < {BODY_RATIO_MIN}"
+                    elif not spike_ok:
+                        reason = f"Spike block — body {last_body:.5f} > {SPIKE_MULT}x avg {avg_body:.5f}"
+                    else:
+                        reason = f"No setup — {trend_label} | EMA20:{ema20_5:.5f} RSI:{rsi5:.1f}"
 
                 # ── DEBUG ─────────────────────────────────────────────
+                pattern_str = ("BullEngulf" if bull_engulf else
+                               "BullReject" if bull_reject else
+                               "BearEngulf" if bear_engulf else
+                               "BearReject" if bear_reject else "None")
                 self.market_debug[symbol] = {
                     "time": time.time(), "gate": gate, "mkt_msg": mkt_msg,
-                    "last_m5": m1_confirmed[-1]["epoch"],
+                    "last_m5": c1[-1]["epoch"] if "epoch" in c1[-1] else 0,
                     "signal": signal,
-                    "ema100": round(ema100, 5),
-                    "bb_upper": round(bb_upper, 5),
-                    "bb_lower": round(bb_lower, 5),
-                    "bb_mid": round(bb_mid, 5),
-                    "above_ema": above_ema, "below_ema": below_ema,
-                    "touches_lower_bb": touches_lower_bb,
-                    "touches_upper_bb": touches_upper_bb,
-                    "stoch_k": round(stoch_k, 1),
-                    "stoch_k_prev": round(stoch_k_prev, 1),
-                    "stoch_d": round(stoch_d, 1),
-                    "stoch_oversold": stoch_oversold,
-                    "stoch_overbought": stoch_overbought,
-                    "candle_bullish": candle_bullish,
-                    "candle_bearish": candle_bearish,
+                    "trend_label": trend_label,
+                    "ema50_15": round(ema50_15, 5),
+                    "ema200_15": round(ema200_15, 5),
+                    "ema20_5": round(ema20_5, 5),
+                    "ema50_5": round(ema50_5, 5),
+                    "ema50_slope": round(ema50_slope, 6),
+                    "slope_rising": slope_rising,
+                    "slope_falling": slope_falling,
+                    "spread_ok": spread_ok,
+                    "pb_touch": pb_touched_ema20_bull or pb_touched_ema20_bear,
+                    "rsi5": round(rsi5, 1),
+                    "rsi_ok": rsi_ok,
+                    "pattern": pattern_str,
+                    "close_vs_ema20": close_above_ema20 if trend_up else close_below_ema20,
+                    "body": round(_body, 2),
+                    "body_ok": body_ok,
+                    "spike_ok": spike_ok,
                     "mkt_losses": self.market_losses_today.get(symbol, 0),
                     "mkt_trades": self.market_trades_today.get(symbol, 0),
                     "why": [reason]
@@ -744,10 +957,12 @@ class StructureBreakBot:
 
                 if signal == "CALL":
                     await self.execute_trade("CALL", symbol,
-                        stoch=round(stoch_k, 1), bb=round(bb_lower, 5), ema=round(ema100, 5))
+                        rsi=round(rsi5, 1), ema20=round(ema20_5, 5),
+                        pattern=pattern_str, trend=trend_label)
                 elif signal == "PUT":
                     await self.execute_trade("PUT", symbol,
-                        stoch=round(stoch_k, 1), bb=round(bb_upper, 5), ema=round(ema100, 5))
+                        rsi=round(rsi5, 1), ema20=round(ema20_5, 5),
+                        pattern=pattern_str, trend=trend_label)
 
             except Exception as e:
                 logger.error(f"Scan error {symbol}: {e}")
@@ -796,43 +1011,43 @@ def main_keyboard():
 
 def format_market_detail(sym, d):
     if not d: return f"\U0001f4cd {sym.replace('frx','')}\n\u23f3 No scan data yet"
-    age = int(time.time() - d.get("time", time.time()))
-    signal = d.get("signal") or "\u2014"
-    why = d.get("why", [])
-    mkt_losses = d.get("mkt_losses", 0); mkt_trades = d.get("mkt_trades", 0)
+    age        = int(time.time() - d.get("time", time.time()))
+    signal     = d.get("signal") or "\u2014"
+    why        = d.get("why", [])
+    mkt_losses = d.get("mkt_losses", 0)
+    mkt_trades = d.get("mkt_trades", 0)
+    trend      = d.get("trend_label", "\u2014")
+    ema50_15   = d.get("ema50_15",  "\u2014")
+    ema200_15  = d.get("ema200_15", "\u2014")
+    ema20_5    = d.get("ema20_5",   "\u2014")
+    ema50_5    = d.get("ema50_5",   "\u2014")
+    slope      = d.get("ema50_slope", 0)
+    slope_str  = "Rising \u2191" if d.get("slope_rising") else ("Falling \u2193" if d.get("slope_falling") else "Flat")
+    spread_ok  = "\u2705" if d.get("spread_ok") else "\u274c"
+    pb_touch   = "\u2705 Touched" if d.get("pb_touch") else "\u23f3 Waiting"
+    rsi5       = d.get("rsi5", "\u2014")
+    rsi_ok     = "\u2705" if d.get("rsi_ok") else "\u274c"
+    pattern    = d.get("pattern", "\u2014")
+    close_ok   = "\u2705" if d.get("close_vs_ema20") else "\u274c"
+    body       = d.get("body", "\u2014")
+    body_ok    = "\u2705" if d.get("body_ok") else "\u274c"
+    spike_ok   = "\u2705" if d.get("spike_ok", True) else "\u274c Spike"
     last_m1    = d.get("last_m5", 0)
-    ema100     = d.get("ema100", "\u2014")
-    bb_upper   = d.get("bb_upper", "\u2014")
-    bb_lower   = d.get("bb_lower", "\u2014")
-    bb_mid     = d.get("bb_mid", "\u2014")
-    above_ema  = d.get("above_ema", False)
-    below_ema  = d.get("below_ema", False)
-    touch_low  = d.get("touches_lower_bb", False)
-    touch_high = d.get("touches_upper_bb", False)
-    stoch_k    = d.get("stoch_k", "\u2014")
-    stoch_kp   = d.get("stoch_k_prev", "\u2014")
-    stoch_d    = d.get("stoch_d", "\u2014")
-    stoch_os   = d.get("stoch_oversold", False)
-    stoch_ob   = d.get("stoch_overbought", False)
-    c_bull     = d.get("candle_bullish", False)
-    c_bear     = d.get("candle_bearish", False)
-    trend_str  = "UPTREND" if above_ema else ("DOWNTREND" if below_ema else "SIDEWAYS")
-    bb_touch   = "Lower BB OK" if touch_low else ("Upper BB OK" if touch_high else "No BB touch")
-    stoch_str  = f"Oversold {stoch_k} crossing up OK" if stoch_os else (f"Overbought {stoch_k} crossing down OK" if stoch_ob else f"Neutral %K:{stoch_k} %D:{stoch_d}")
-    candle_str = "Bullish OK" if c_bull else ("Bearish OK" if c_bear else "Doji")
     return (
         f"\U0001f4cd {sym.replace('frx','')} ({age}s ago)\n"
         f"Market: {d.get('mkt_msg','OK')} | {mkt_trades}/{MAX_TRADES_PER_MARKET} | {mkt_losses}/{MAX_LOSSES_PER_MARKET} losses\n"
-        f"Last M1: {fmt_time_hhmmss(last_m1)}\n"
+        f"Last 1M: {fmt_time_hhmmss(last_m1)}\n"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
-        f"Trend (EMA100): {trend_str} | EMA: {ema100}\n"
-        f"BB Upper: {bb_upper} | Mid: {bb_mid} | Lower: {bb_lower}\n"
-        f"BB Touch: {bb_touch}\n"
-        f"Stoch %K:{stoch_k} %D:{stoch_d}: {stoch_str}\n"
-        f"Candle: {candle_str}\n"
+        f"15M Trend: {trend} | EMA50:{ema50_15} EMA200:{ema200_15}\n"
+        f"5M Slope: {slope_str} ({slope:.6f}) | Spread: {spread_ok}\n"
+        f"5M EMA20:{ema20_5} EMA50:{ema50_5}\n"
+        f"5M Pullback: {pb_touch} | RSI:{rsi5} {rsi_ok}\n"
+        f"1M Pattern: {pattern} | Close vs EMA20: {close_ok}\n"
+        f"1M Body: {body} {body_ok} | Spike: {spike_ok}\n"
         f"Signal: {signal}\n"
         f"Why: {why[0] if why else chr(8212)}\n"
     )
+
 
 async def _safe_answer(q, text=None, show_alert=False):
     try: await q.answer(text=text, show_alert=show_alert)
@@ -975,7 +1190,7 @@ async def btn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💰 Equity: {eq_ratio:.0%} | 🔒 Lock: {lock_str}\n"
                 f"🎯 Target: +${DAILY_PROFIT_TARGET:.2f} | Limit: ${DAILY_LOSS_LIMIT:.2f}\n"
                 f"📡 Pairs: EURUSD GBPUSD USDJPY AUDUSD GBPJPY\n"
-                f"🧭 BB Pullback | EMA100 + BB touch + Stochastic + candle | {EXPIRY_MIN}m expiry\n"
+                f"🧭 15M trend (EMA50/200) + 5M pullback (EMA20+slope) + 1M entry (engulf/reject) | {EXPIRY_MIN}m\n"
                 f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
                 f"{stats_block}{mkt_block}"
                 f"💵 PnL: {bot_logic.total_profit_today:+.2f} | Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY}\n"

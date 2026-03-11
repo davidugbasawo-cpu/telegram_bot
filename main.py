@@ -716,14 +716,15 @@ class StructureBreakBot:
                 mkt_ok, mkt_msg = self._is_market_available(symbol)
 
                 # ── FETCH ALL 3 TIMEFRAMES ───────────────────────────
-                tf15_task = asyncio.create_task(
-                    self.fetch_candles_with_timeout(symbol, TF_15M_SEC, CANDLES_15M))
-                tf5_task  = asyncio.create_task(
-                    self.fetch_candles_with_timeout(symbol, TF_5M_SEC,  CANDLES_5M))
-                tf1_task  = asyncio.create_task(
-                    self.fetch_candles_with_timeout(symbol, TF_M1_SEC,  CANDLES_M1))
-                candles_15m, candles_5m, candles_1m = await asyncio.gather(
-                    tf15_task, tf5_task, tf1_task)
+                try:
+                    candles_15m = await self.fetch_candles_with_timeout(symbol, TF_15M_SEC, CANDLES_15M)
+                    candles_5m  = await self.fetch_candles_with_timeout(symbol, TF_5M_SEC,  CANDLES_5M)
+                    candles_1m  = await self.fetch_candles_with_timeout(symbol, TF_M1_SEC,  CANDLES_M1)
+                except Exception as fe:
+                    self.market_debug[symbol] = {"time": time.time(), "gate": gate,
+                        "why": [f"Fetch error: {str(fe)[:120]}"]}
+                    await asyncio.sleep(10)
+                    continue
 
                 # Need enough candles for all indicators
                 if len(candles_15m) < EMA_TREND_SLOW + 10:
@@ -992,6 +993,8 @@ class StructureBreakBot:
 
             except Exception as e:
                 logger.error(f"Scan error {symbol}: {e}")
+                self.market_debug[symbol] = {"time": time.time(),
+                    "why": [f"Scan error: {str(e)[:120]}"]}
                 await asyncio.sleep(10)
 
     async def _connection_watchdog(self):

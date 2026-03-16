@@ -661,10 +661,17 @@ class BitgetBot:
 
     async def scan_symbol(self, symbol, stagger=0):
         await asyncio.sleep(stagger)
+        # Mark as initializing immediately so status shows something
+        self.market_debug[symbol] = {"time": time.time(), "why": "Initializing...", "signal": None}
         while self.is_scanning:
             try:
                 await asyncio.sleep(SCAN_INTERVAL_SEC)
                 self._reset_daily()
+
+                if not self.exchange:
+                    self.market_debug[symbol] = {"time": time.time(), "why": "Not connected — press CONNECT", "signal": None}
+                    await asyncio.sleep(5)
+                    continue
 
                 if symbol in self.active_positions:
                     continue
@@ -675,6 +682,8 @@ class BitgetBot:
                         "time": time.time(), "why": gate, "signal": None}
                     continue
 
+                self.market_debug[symbol] = {"time": time.time(), "why": "Fetching candles...", "signal": None}
+
                 # Fetch candles sequentially to avoid rate limits
                 c15 = await self.fetch_ohlcv(symbol, TF_TREND,   CANDLES_15M)
                 await asyncio.sleep(0.3)
@@ -684,7 +693,9 @@ class BitgetBot:
 
                 if not c15 or not c5 or not c1:
                     self.market_debug[symbol] = {
-                        "time": time.time(), "why": "Missing candles", "signal": None}
+                        "time": time.time(),
+                        "why": f"Candle fetch failed — 15M:{len(c15)} 5M:{len(c5)} 1M:{len(c1)}. Check API connection.",
+                        "signal": None}
                     continue
 
                 signal, reason, dbg = self.build_signal(symbol, c15, c5, c1)

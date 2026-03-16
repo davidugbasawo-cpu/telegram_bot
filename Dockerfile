@@ -6,17 +6,19 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Install build-essential for numpy and other C-based libraries
+# Install dependencies needed for numpy + timezone support
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip first, then install requirements
+# Upgrade pip and install Python packages
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application
+# Copy project files
 COPY . .
 
-CMD ["python", "main.py"]
+# Start the bot
+CMD ["python", "bitget_crypto_bot.py"]

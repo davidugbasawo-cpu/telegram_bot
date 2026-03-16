@@ -1,6 +1,4 @@
-
-python-deriv-api
+ccxt==4.3.57
 python-telegram-bot==21.1
 numpy
-websockets
-reactivex
+aiohttp

@@ -61,14 +61,6 @@ BODY_RATIO_MIN       = 0.32   # min body ratio — no dojis
 SPIKE_MULT           = 1.80   # spike block multiplier
 SPIKE_LOOKBACK       = 20     # candles for avg body
 
-# ========================= SESSION FILTER (UTC) =========================
-# Only trade during active crypto hours
-ACTIVE_SESSIONS = [
-    (0, 4),    # Asia open
-    (8, 12),   # London open
-    (13, 17),  # NY open
-]
-
 # ========================= RISK =========================
 RISK_PER_TRADE    = 0.01   # 1% of balance per trade
 LEVERAGE          = 3
@@ -185,14 +177,6 @@ def is_bearish_rejection(c):
 
 
 # ========================= SESSION =========================
-def is_active_session():
-    hour_utc = datetime.utcnow().hour
-    for start, end in ACTIVE_SESSIONS:
-        if start <= hour_utc < end:
-            return True, f"Active session ({hour_utc:02d}:00 UTC)"
-    return False, f"Dead hours ({hour_utc:02d}:00 UTC) — waiting for session"
-
-
 def now_wat():
     return datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -685,13 +669,6 @@ class BitgetBot:
                 if symbol in self.active_positions:
                     continue
 
-                # Session filter
-                session_ok, session_msg = is_active_session()
-                if not session_ok:
-                    self.market_debug[symbol] = {
-                        "time": time.time(), "why": session_msg, "signal": None}
-                    continue
-
                 can, gate = self.can_trade()
                 if not can:
                     self.market_debug[symbol] = {
@@ -861,7 +838,6 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bot.status_cd_until = now + STATUS_REFRESH_COOLDOWN
         await bot.fetch_balance()
         _, gate = bot.can_trade()
-        session_ok, session_msg = is_active_session()
 
         open_pos = ""
         for sym, pos in bot.active_positions.items():
@@ -880,8 +856,7 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🎯 RR 1:{RR_RATIO} | Risk {RISK_PER_TRADE:.1%} | {LEVERAGE}x\n"
             f"📉 Streak: {bot.consec_losses}/{MAX_CONSEC_LOSSES} | "
             f"Trades: {bot.trades_today}/{MAX_TRADES_PER_DAY}\n"
-            f"🕐 Session: {session_msg}\n"
-            f"🚦 Gate: {gate}"
+                f"🚦 Gate: {gate}"
         )
 
         if open_pos:

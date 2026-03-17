@@ -815,9 +815,32 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
         "1. Press CONNECT\n"
         "2. Press START\n"
-        "3. Press STATUS to monitor",
+        "3. Press STATUS to monitor\n"
+        "4. Send /symbols to check available pairs",
         reply_markup=keyboard()
     )
+
+
+async def symbols_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """List all SOL, DOGE, XRP USDT perpetual markets available on Bitget"""
+    bot._chat_ids.add(update.message.chat_id)
+    if not bot.exchange:
+        await update.message.reply_text("❌ Connect first — press CONNECT button")
+        return
+    try:
+        markets = bot.exchange.markets
+        sol  = [s for s in markets.keys() if "SOL"  in s and "USDT" in s]
+        doge = [s for s in markets.keys() if "DOGE" in s and "USDT" in s]
+        xrp  = [s for s in markets.keys() if "XRP"  in s and "USDT" in s]
+        msg = (
+            f"📋 Available USDT Markets on Bitget\n\n"
+            f"SOL pairs:\n" + "\n".join(sol[:10] or ["None found"]) + "\n\n"
+            f"DOGE pairs:\n" + "\n".join(doge[:10] or ["None found"]) + "\n\n"
+            f"XRP pairs:\n" + "\n".join(xrp[:10] or ["None found"])
+        )
+        await update.message.reply_text(msg[:4000])
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
 
 
 # ========================= MAIN =========================
@@ -828,6 +851,7 @@ if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     bot.app = app
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("symbols", symbols_cmd))
     app.add_handler(CallbackQueryHandler(btn_handler))
 
     loop = asyncio.new_event_loop()

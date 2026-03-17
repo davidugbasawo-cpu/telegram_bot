@@ -1,10 +1,23 @@
 """
 Bitget Crypto Futures Bot
-Strategy: 15M/5M/1M Trend Pullback
-  15M → trend direction (EMA50/EMA200 + slope)
-  5M  → pullback quality (EMA20 near-touch + EMA50 slope + RSI)
-  1M  → entry trigger (engulfing/rejection + close vs EMA20 + body + spike)
-Pairs: BTCUSDT, ETHUSDT, SOLUSDT perpetual futures
+Strategy: 15M Trend + 5M Breakout with Chop Filter
+  15M → trend direction (EMA 200 only)
+  5M  → breakout entry (previous candle high/low break + body strength + range filter)
+Pairs: SOL/USDT:USDT, DOGE/USDT:USDT, XRP/USDT:USDT perpetual futures
+
+Changes from previous version:
+- Simplified to EMA 200 only (removed EMA50, RSI, MACD etc.)
+- New chop filter: EMA distance + trend clarity + 15M candle strength
+- New entry: 5M breakout of previous candle high/low
+- Body >= 50% of candle range required
+- 5M sideways filter: breakout candle range >= avg of last 10 candles
+- Session filter: only trade during active sessions (UTC)
+- Precise EMA distance rule: price must be >= 0.5% from EMA200
+- Minimum SL distance: >= 0.15% of entry price
+- Daily trade limit: 6
+- Consecutive loss pause: 3 losses = 2 hour pause
+- Fixed risk: $0.25 per trade
+- RR: 1:3
 """
 
 import asyncio
@@ -33,54 +46,54 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "8697638086:AAG00D0RXUAqXFTjy8-4
 USE_TESTNET = os.getenv("BITGET_TESTNET", "true").lower() == "true"
 
 # ========================= MARKETS =========================
-SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
+SYMBOLS = ["SOL/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"]
 
 # ========================= TIMEFRAMES =========================
 TF_TREND   = "15m"
-TF_SETUP   = "5m"
-TF_TRIGGER = "1m"
+TF_ENTRY   = "5m"
 CANDLES_15M = 250
-CANDLES_5M  = 150
-CANDLES_1M  = 60
+CANDLES_5M  = 60
 
-# ========================= INDICATORS =========================
-EMA_TREND_FAST     = 50
-EMA_TREND_SLOW     = 200
-EMA_PULLBACK       = 20
-EMA_SETUP_SLOW     = 50
-EMA_SLOPE_LOOKBACK = 10
-RSI_PERIOD         = 14
-ATR_PERIOD         = 14
+# ========================= INDICATOR =========================
+EMA_PERIOD = 200   # Only one EMA — keep it simple
 
-# ========================= FILTERS =========================
-RSI_MIN              = 40     # both directions
-RSI_MAX              = 65     # both directions
-EMA_SPREAD_ATR_MULT  = 0.20   # min EMA20/50 spread vs ATR
-PULLBACK_ATR_BUFFER  = 0.30   # near-touch: within 0.3x ATR counts
-BODY_RATIO_MIN       = 0.32   # min body ratio — no dojis
-SPIKE_MULT           = 1.80   # spike block multiplier
-SPIKE_LOOKBACK       = 20     # candles for avg body
+# ========================= CHOP FILTER =========================
+EMA_DISTANCE_MIN_PCT  = 0.005   # Price must be >= 0.5% from EMA200 on 15M
+CANDLE_BODY_RATIO_MIN = 0.50    # 15M last candle body must be >= 50% of range
+SLOPE_LOOKBACK        = 5       # Candles to measure EMA200 slope direction
+
+# ========================= ENTRY FILTER =========================
+BREAKOUT_BODY_MIN     = 0.50    # 5M breakout candle body >= 50% of range
+SIDEWAYS_LOOKBACK     = 10      # Candles to calculate avg range for sideways filter
+
+# ========================= SESSION FILTER =========================
+# Only trade during active market hours (UTC)
+# London/NY overlap: 12:00-16:00 UTC
+# New York session:  13:00-21:00 UTC
+SESSION_START_UTC = 12   # 12:00 UTC
+SESSION_END_UTC   = 21   # 21:00 UTC
 
 # ========================= RISK =========================
-RISK_PER_TRADE    = 0.01   # 1% of balance per trade
+RISK_PER_TRADE    = 0.25   # Fixed $0.25 per trade
 LEVERAGE          = 3
-RR_RATIO          = 4.0    # 1:4 risk/reward
-BREAKEVEN_RR      = 1.5    # move SL to entry when up 1.5x risk
+RR_RATIO          = 3.0    # 1:3 risk/reward
+MIN_SL_PCT        = 0.0015 # Minimum SL distance = 0.15% of entry
 
 # ========================= LIMITS =========================
-MAX_TRADES_PER_DAY  = 6
-MAX_CONSEC_LOSSES   = 3
-COOLDOWN_SEC        = 300   # 5 min between trades
-MAX_OPEN_POSITIONS  = 1
+MAX_TRADES_PER_DAY   = 6
+MAX_CONSEC_LOSSES    = 3
+CONSEC_LOSS_PAUSE_HR = 2      # Pause 2 hours after 3 consecutive losses
+COOLDOWN_SEC         = 300    # 5 min between trades
+MAX_OPEN_POSITIONS   = 1
 
 # ========================= OTHER =========================
-TRADE_LOG_FILE            = "bitget_trades.json"
-SCAN_INTERVAL_SEC         = 20
-STATUS_REFRESH_COOLDOWN   = 10
-TIMEZONE                  = "Africa/Lagos"
+TRADE_LOG_FILE          = "bitget_trades.json"
+SCAN_INTERVAL_SEC       = 15
+STATUS_REFRESH_COOLDOWN = 10
+TIMEZONE                = "Africa/Lagos"
 
 
-# ========================= INDICATORS =========================
+# ========================= HELPERS =========================
 def ema_value(closes, period):
     closes = np.array(closes, dtype=float)
     if len(closes) < period:
@@ -105,78 +118,20 @@ def ema_series(closes, period):
     return out
 
 
-def rsi_value(closes, period=14):
-    closes = np.array(closes, dtype=float)
-    if len(closes) < period + 1:
-        return None
-    deltas = np.diff(closes)
-    gains  = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = float(np.mean(gains[:period]))
-    avg_loss = float(np.mean(losses[:period]))
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0:
-        return 100.0
-    return float(100 - (100 / (1 + avg_gain / avg_loss)))
-
-
-def atr_value(highs, lows, closes, period=14):
-    highs  = np.array(highs,  dtype=float)
-    lows   = np.array(lows,   dtype=float)
-    closes = np.array(closes, dtype=float)
-    if len(closes) < period + 1:
-        return None
-    trs = []
-    for i in range(1, len(closes)):
-        tr = max(highs[i] - lows[i],
-                 abs(highs[i] - closes[i-1]),
-                 abs(lows[i]  - closes[i-1]))
-        trs.append(tr)
-    if len(trs) < period:
-        return None
-    atr = float(np.mean(trs[:period]))
-    for tr in trs[period:]:
-        atr = (atr * (period - 1) + tr) / period
-    return float(atr)
-
-
-# ========================= PATTERNS =========================
-def body_ratio(candle):
-    rng = abs(candle[2] - candle[3])
+def candle_body_ratio(candle):
+    """Body as ratio of total candle range"""
+    rng = abs(candle[2] - candle[3])  # high - low
     if rng == 0:
         return 0.0
-    return abs(candle[4] - candle[1]) / rng
+    return abs(candle[4] - candle[1]) / rng  # |close - open| / range
 
 
-def is_bullish_engulfing(prev, cur):
-    return (prev[4] < prev[1] and cur[4] > cur[1]
-            and cur[4] >= prev[1] and cur[1] <= prev[4])
+def is_session_active():
+    """Check if current UTC hour is within active trading session"""
+    utc_hour = datetime.utcnow().hour
+    return SESSION_START_UTC <= utc_hour < SESSION_END_UTC
 
 
-def is_bearish_engulfing(prev, cur):
-    return (prev[4] > prev[1] and cur[4] < cur[1]
-            and cur[4] <= prev[1] and cur[1] >= prev[4])
-
-
-def is_bullish_rejection(c):
-    o, h, l, cl = c[1], c[2], c[3], c[4]
-    rng   = max(1e-10, h - l)
-    body  = abs(cl - o)
-    lower = min(o, cl) - l
-    return lower / rng >= 0.45 and body / rng <= 0.55 and cl >= o
-
-
-def is_bearish_rejection(c):
-    o, h, l, cl = c[1], c[2], c[3], c[4]
-    rng   = max(1e-10, h - l)
-    body  = abs(cl - o)
-    upper = h - max(o, cl)
-    return upper / rng >= 0.45 and body / rng <= 0.55 and cl <= o
-
-
-# ========================= SESSION =========================
 def now_wat():
     return datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -189,11 +144,7 @@ class Signal:
     entry:   float
     stop:    float
     target:  float
-    be_level: float   # breakeven trigger price
-    atr:     float
     reason:  str
-    pattern: str
-    rsi:     float
 
 
 # ========================= BOT =========================
@@ -287,17 +238,29 @@ class BitgetBot:
 
     def can_trade(self):
         self._reset_daily()
+
+        # Session filter
+        if not is_session_active():
+            utc_hour = datetime.utcnow().hour
+            return False, f"Outside session ({utc_hour:02d}:00 UTC) — active {SESSION_START_UTC:02d}:00-{SESSION_END_UTC:02d}:00"
+
         if time.time() < self.pause_until:
-            return False, "Paused"
+            remaining = int((self.pause_until - time.time()) / 60)
+            return False, f"Paused after {MAX_CONSEC_LOSSES} losses — {remaining}min left"
+
         if time.time() < self.cooldown_until:
             left = int(self.cooldown_until - time.time())
             return False, f"Cooldown {left}s"
+
         if len(self.active_positions) >= MAX_OPEN_POSITIONS:
             return False, "Max positions open"
+
         if self.trades_today >= MAX_TRADES_PER_DAY:
-            return False, "Daily trade limit reached"
+            return False, f"Daily limit reached ({MAX_TRADES_PER_DAY})"
+
         if self.consec_losses >= MAX_CONSEC_LOSSES:
             return False, f"Paused — {MAX_CONSEC_LOSSES} consecutive losses"
+
         return True, "OK"
 
     async def fetch_ohlcv(self, symbol, tf, limit):
@@ -309,194 +272,167 @@ class BitgetBot:
             logger.warning(f"OHLCV {symbol} {tf}: {e}")
             return []
 
-    def build_signal(self, symbol, c15, c5, c1):
+    def build_signal(self, symbol, c15, c5):
         """
         Returns (Signal | None, reason_str, debug_dict)
+
+        Logic:
+        1. 15M EMA200 direction → trend
+        2. Chop filter: EMA distance + slope + last 15M candle body
+        3. 5M: breakout of previous candle high (BUY) or low (SELL)
+        4. Breakout candle body >= 50%
+        5. Breakout candle range >= avg of last 10 candles (sideways filter)
+        6. SL below/above previous 5M candle
+        7. Min SL distance check
         """
         dbg = {}
 
         # ── 15M TREND ──────────────────────────────────────
-        if len(c15) < EMA_TREND_SLOW + 10:
+        if len(c15) < EMA_PERIOD + SLOPE_LOOKBACK + 5:
             return None, "15M warming up", dbg
 
         cl15 = [x[4] for x in c15]
-        hi15 = [x[2] for x in c15]
-        lo15 = [x[3] for x in c15]
+        last_15 = c15[-1]
+        price15 = cl15[-1]
 
-        ema50_15  = ema_value(cl15, EMA_TREND_FAST)
-        ema200_15 = ema_value(cl15, EMA_TREND_SLOW)
-        atr15     = atr_value(hi15, lo15, cl15, ATR_PERIOD)
-        price15   = cl15[-1]
+        ema200_series = ema_series(cl15, EMA_PERIOD)
+        if not ema200_series or ema200_series[-1] is None:
+            return None, "EMA200 not ready", dbg
 
-        # 15M EMA50 slope
-        ema50_15_series = ema_series(cl15, EMA_TREND_FAST)
-        slope_idx = -(EMA_SLOPE_LOOKBACK + 1)
-        ema50_15_slope = 0.0
-        if len(ema50_15_series) > abs(slope_idx) and ema50_15_series[slope_idx]:
-            ema50_15_slope = ema50_15 - ema50_15_series[slope_idx]
+        ema200 = ema200_series[-1]
 
-        if None in (ema50_15, ema200_15, atr15):
-            return None, "15M indicators not ready", dbg
+        # EMA200 slope — compare current vs N candles ago
+        old_ema = None
+        for val in reversed(ema200_series[-(SLOPE_LOOKBACK+2):-1]):
+            if val is not None:
+                old_ema = val
+                break
+        ema_slope = (ema200 - old_ema) if old_ema else 0.0
 
-        trend_up   = (ema50_15 > ema200_15
-                      and price15 > ema50_15
-                      and ema50_15_slope > 0)
-        trend_down = (ema50_15 < ema200_15
-                      and price15 < ema50_15
-                      and ema50_15_slope < 0)
+        trend_up   = price15 > ema200 and ema_slope > 0
+        trend_down = price15 < ema200 and ema_slope < 0
 
-        dbg["ema50_15"]       = round(ema50_15, 4)
-        dbg["ema200_15"]      = round(ema200_15, 4)
-        dbg["15m_slope"]      = round(ema50_15_slope, 6)
-        dbg["trend"]          = "UP" if trend_up else "DOWN" if trend_down else "SIDE"
+        dbg["ema200_15"]  = round(ema200, 5)
+        dbg["price15"]    = round(price15, 5)
+        dbg["ema_slope"]  = round(ema_slope, 6)
+        dbg["trend"]      = "UP" if trend_up else "DOWN" if trend_down else "SIDE"
 
         if not trend_up and not trend_down:
-            return None, f"15M sideways | EMA50:{ema50_15:.2f} EMA200:{ema200_15:.2f}", dbg
+            return None, f"15M sideways | Price:{price15:.4f} EMA200:{ema200:.4f}", dbg
 
-        # ── 5M PULLBACK ────────────────────────────────────
-        if len(c5) < EMA_SETUP_SLOW + EMA_SLOPE_LOOKBACK + 5:
+        # ── CHOP FILTER ────────────────────────────────────
+        # 1. EMA distance — price must be >= 0.5% from EMA200
+        ema_dist_pct = abs(price15 - ema200) / ema200
+        dist_ok = ema_dist_pct >= EMA_DISTANCE_MIN_PCT
+
+        # 2. EMA slope must not be flat (already embedded in trend_up/down)
+        slope_ok = ema_slope != 0.0
+
+        # 3. Last 15M candle must have body >= 50% of range (no doji)
+        last_15_body = candle_body_ratio(last_15)
+        candle_ok = last_15_body >= CANDLE_BODY_RATIO_MIN
+
+        dbg["ema_dist_pct"]  = round(ema_dist_pct * 100, 3)
+        dbg["dist_ok"]       = dist_ok
+        dbg["candle_ok"]     = candle_ok
+        dbg["last_15_body"]  = round(last_15_body, 2)
+
+        if not dist_ok:
+            return None, f"Price too close to EMA200 ({ema_dist_pct*100:.2f}% < 0.5%)", dbg
+        if not candle_ok:
+            return None, f"Weak 15M candle — body {last_15_body:.2f} < 0.50 (doji/indecision)", dbg
+
+        # ── 5M ENTRY ───────────────────────────────────────
+        if len(c5) < SIDEWAYS_LOOKBACK + 3:
             return None, "5M warming up", dbg
 
-        cl5 = [x[4] for x in c5]
-        hi5 = [x[2] for x in c5]
-        lo5 = [x[3] for x in c5]
+        prev5 = c5[-2]   # Previous confirmed candle
+        cur5  = c5[-1]   # Current forming candle (last confirmed)
 
-        ema20_5_series = ema_series(cl5, EMA_PULLBACK)
-        ema50_5_series = ema_series(cl5, EMA_SETUP_SLOW)
-        rsi5  = rsi_value(cl5, RSI_PERIOD)
-        atr5  = atr_value(hi5, lo5, cl5, ATR_PERIOD)
+        prev_high = prev5[2]
+        prev_low  = prev5[3]
+        cur_open  = cur5[1]
+        cur_close = cur5[4]
+        cur_high  = cur5[2]
+        cur_low   = cur5[3]
 
-        if not ema20_5_series or not ema50_5_series or rsi5 is None or atr5 is None:
-            return None, "5M indicators not ready", dbg
+        # Breakout check
+        bull_breakout = cur_close > prev_high and cur_open <= prev_high
+        bear_breakout = cur_close < prev_low  and cur_open >= prev_low
 
-        ema20_5 = ema20_5_series[-1]
-        ema50_5 = ema50_5_series[-1]
+        # Breakout candle body ratio
+        cur_body = candle_body_ratio(cur5)
+        body_ok  = cur_body >= BREAKOUT_BODY_MIN
 
-        # 5M EMA50 slope
-        ema50_5_old = ema50_5_series[-(EMA_SLOPE_LOOKBACK + 1)] if len(ema50_5_series) > EMA_SLOPE_LOOKBACK + 1 else None
-        ema50_5_slope = (ema50_5 - ema50_5_old) if ema50_5_old else 0.0
+        # Sideways filter — current candle range vs average of last N candles
+        recent_ranges = [abs(c[2] - c[3]) for c in c5[-(SIDEWAYS_LOOKBACK+2):-2]]
+        avg_range     = sum(recent_ranges) / len(recent_ranges) if recent_ranges else 0
+        cur_range     = abs(cur_high - cur_low)
+        range_ok      = avg_range == 0 or cur_range >= avg_range
 
-        spread_ok      = abs(ema20_5 - ema50_5) >= EMA_SPREAD_ATR_MULT * atr5
-        rsi_ok         = RSI_MIN <= rsi5 <= RSI_MAX
-        slope_5_rising = ema50_5_slope > 0
-        slope_5_falling= ema50_5_slope < 0
+        dbg["prev_high"]    = round(prev_high, 5)
+        dbg["prev_low"]     = round(prev_low, 5)
+        dbg["bull_break"]   = bull_breakout
+        dbg["bear_break"]   = bear_breakout
+        dbg["cur_body"]     = round(cur_body, 2)
+        dbg["body_ok"]      = body_ok
+        dbg["range_ok"]     = range_ok
+        dbg["cur_range"]    = round(cur_range, 5)
+        dbg["avg_range"]    = round(avg_range, 5)
 
-        # Near-touch pullback — within 0.3x ATR counts
-        pb = c5[-1]
-        pb_touch_bull  = pb[3] <= ema20_5 + (PULLBACK_ATR_BUFFER * atr5)
-        pb_touch_bear  = pb[2] >= ema20_5 - (PULLBACK_ATR_BUFFER * atr5)
-        pb_above_ema50 = pb[4] > ema50_5
-        pb_below_ema50 = pb[4] < ema50_5
+        # ── LONG SETUP ─────────────────────────────────────
+        if trend_up and bull_breakout and body_ok and range_ok:
+            entry = float(cur_close)
+            stop  = float(prev_low)
 
-        dbg["ema20_5"]       = round(ema20_5, 4)
-        dbg["ema50_5"]       = round(ema50_5, 4)
-        dbg["5m_slope"]      = round(ema50_5_slope, 6)
-        dbg["rsi5"]          = round(rsi5, 1)
-        dbg["rsi_ok"]        = rsi_ok
-        dbg["spread_ok"]     = spread_ok
-        dbg["pb_touch_bull"] = pb_touch_bull
-        dbg["pb_touch_bear"] = pb_touch_bear
-        dbg["atr5"]          = round(atr5, 4)
+            # Minimum SL distance check
+            min_sl = entry * MIN_SL_PCT
+            if (entry - stop) < min_sl:
+                return None, f"SL too tight ({entry-stop:.5f} < min {min_sl:.5f})", dbg
 
-        # ── 1M ENTRY TRIGGER ───────────────────────────────
-        if len(c1) < SPIKE_LOOKBACK + 3:
-            return None, "1M warming up", dbg
-
-        prev1 = c1[-2]
-        cur1  = c1[-1]
-
-        bull_engulf  = is_bullish_engulfing(prev1, cur1)
-        bear_engulf  = is_bearish_engulfing(prev1, cur1)
-        bull_reject  = is_bullish_rejection(cur1)
-        bear_reject  = is_bearish_rejection(cur1)
-        bull_pattern = bull_engulf or bull_reject
-        bear_pattern = bear_engulf or bear_reject
-
-        close_above_ema20 = cur1[4] > ema20_5
-        close_below_ema20 = cur1[4] < ema20_5
-        br = body_ratio(cur1)
-        body_ok = br >= BODY_RATIO_MIN
-
-        recent_bodies = [abs(x[4] - x[1]) for x in c1[-(SPIKE_LOOKBACK+2):-2]]
-        avg_body      = sum(recent_bodies) / len(recent_bodies) if recent_bodies else 0
-        last_body     = abs(cur1[4] - cur1[1])
-        spike_ok      = avg_body == 0 or last_body <= SPIKE_MULT * avg_body
-
-        pattern_str = ("BullEngulf" if bull_engulf else
-                       "BullReject" if bull_reject else
-                       "BearEngulf" if bear_engulf else
-                       "BearReject" if bear_reject else "None")
-
-        dbg["pattern"]          = pattern_str
-        dbg["close_above_ema20"]= close_above_ema20
-        dbg["close_below_ema20"]= close_below_ema20
-        dbg["body_ratio"]       = round(br, 2)
-        dbg["body_ok"]          = body_ok
-        dbg["spike_ok"]         = spike_ok
-
-        # ── LONG SIGNAL ────────────────────────────────────
-        if (trend_up and spread_ok and slope_5_rising
-                and pb_touch_bull and pb_above_ema50
-                and rsi_ok and bull_pattern
-                and close_above_ema20 and body_ok and spike_ok):
-
-            entry    = float(cur1[4])
-            stop     = float(min(pb[3], cur1[3]) - atr5 * 0.2)
             if stop >= entry:
-                return None, "Invalid long SL", dbg
-            risk     = entry - stop
-            target   = entry + risk * RR_RATIO
-            be_level = entry + risk * BREAKEVEN_RR
-            return Signal("buy", symbol, entry, stop, target, be_level,
-                          float(atr5),
-                          f"15M UP + 5M pullback EMA20 + RSI {rsi5:.1f} + {pattern_str}",
-                          pattern_str, float(rsi5)), "LONG ✅", dbg
+                return None, "Invalid long SL >= entry", dbg
 
-        # ── SHORT SIGNAL ───────────────────────────────────
-        if (trend_down and spread_ok and slope_5_falling
-                and pb_touch_bear and pb_below_ema50
-                and rsi_ok and bear_pattern
-                and close_below_ema20 and body_ok and spike_ok):
+            risk   = entry - stop
+            target = entry + risk * RR_RATIO
 
-            entry    = float(cur1[4])
-            stop     = float(max(pb[2], cur1[2]) + atr5 * 0.2)
+            return Signal(
+                "buy", symbol, entry, stop, target,
+                f"15M UP + 5M breakout above {prev_high:.4f} | Body:{cur_body:.2f}"
+            ), "LONG ✅", dbg
+
+        # ── SHORT SETUP ────────────────────────────────────
+        if trend_down and bear_breakout and body_ok and range_ok:
+            entry = float(cur_close)
+            stop  = float(prev_high)
+
+            # Minimum SL distance check
+            min_sl = entry * MIN_SL_PCT
+            if (stop - entry) < min_sl:
+                return None, f"SL too tight ({stop-entry:.5f} < min {min_sl:.5f})", dbg
+
             if stop <= entry:
-                return None, "Invalid short SL", dbg
-            risk     = stop - entry
-            target   = entry - risk * RR_RATIO
-            be_level = entry - risk * BREAKEVEN_RR
-            return Signal("sell", symbol, entry, stop, target, be_level,
-                          float(atr5),
-                          f"15M DOWN + 5M pullback EMA20 + RSI {rsi5:.1f} + {pattern_str}",
-                          pattern_str, float(rsi5)), "SHORT ✅", dbg
+                return None, "Invalid short SL <= entry", dbg
+
+            risk   = stop - entry
+            target = entry - risk * RR_RATIO
+
+            return Signal(
+                "sell", symbol, entry, stop, target,
+                f"15M DOWN + 5M breakout below {prev_low:.4f} | Body:{cur_body:.2f}"
+            ), "SHORT ✅", dbg
 
         # ── NO SIGNAL — detailed reason ────────────────────
-        if not spread_ok:
-            reason = f"5M ranging — spread too tight"
-        elif trend_up and not slope_5_rising:
-            reason = f"5M slope flat/falling — momentum weak"
-        elif trend_down and not slope_5_falling:
-            reason = f"5M slope flat/rising — momentum weak"
-        elif trend_up and not pb_touch_bull:
-            reason = f"Waiting 5M pullback to EMA20 ({ema20_5:.4f})"
-        elif trend_down and not pb_touch_bear:
-            reason = f"Waiting 5M pullback to EMA20 ({ema20_5:.4f})"
-        elif not rsi_ok:
-            reason = f"RSI {rsi5:.1f} outside {RSI_MIN}–{RSI_MAX}"
-        elif trend_up and not bull_pattern:
-            reason = "Waiting 1M bullish pattern"
-        elif trend_down and not bear_pattern:
-            reason = "Waiting 1M bearish pattern"
-        elif trend_up and not close_above_ema20:
-            reason = f"1M close not above EMA20 ({ema20_5:.4f})"
-        elif trend_down and not close_below_ema20:
-            reason = f"1M close not below EMA20 ({ema20_5:.4f})"
+        if trend_up and not bull_breakout:
+            reason = f"Waiting 5M breakout above {prev_high:.4f} (cur:{cur_close:.4f})"
+        elif trend_down and not bear_breakout:
+            reason = f"Waiting 5M breakout below {prev_low:.4f} (cur:{cur_close:.4f})"
         elif not body_ok:
-            reason = f"Weak body {br:.2f} < {BODY_RATIO_MIN}"
-        elif not spike_ok:
-            reason = "Spike candle blocked"
+            reason = f"Weak breakout candle body {cur_body:.2f} < {BREAKOUT_BODY_MIN}"
+        elif not range_ok:
+            reason = f"Candle too small — range {cur_range:.5f} < avg {avg_range:.5f}"
         else:
-            reason = f"No setup | RSI:{rsi5:.1f} slope:{ema50_5_slope:.4f}"
+            reason = "No valid setup"
 
         return None, reason, dbg
 
@@ -507,8 +443,9 @@ class BitgetBot:
             logger.warning(f"Leverage set failed {symbol}: {e}")
 
     async def get_size(self, symbol, entry, stop):
+        """Calculate position size based on fixed $0.25 risk"""
         await self.fetch_balance()
-        risk_amount   = max(1.0, self.balance_usdt * RISK_PER_TRADE)
+        risk_amount   = RISK_PER_TRADE   # Fixed $0.25
         stop_distance = abs(entry - stop)
         if stop_distance <= 0:
             return 0.0
@@ -569,21 +506,20 @@ class BitgetBot:
                 "entry":     avg_price,
                 "stop":      signal.stop,
                 "target":    signal.target,
-                "be_level":  signal.be_level,
-                "be_moved":  False,
                 "opened_at": time.time(),
             }
-            self.trades_today    += 1
-            self.cooldown_until   = time.time() + COOLDOWN_SEC
+            self.trades_today   += 1
+            self.cooldown_until  = time.time() + COOLDOWN_SEC
 
             sym_clean = signal.symbol.replace("/USDT:USDT", "")
+            risk_actual = abs(avg_price - signal.stop) * size
             await self.tg(
                 f"🚀 {sym_clean} {signal.side.upper()}\n"
-                f"Entry:  {avg_price:.4f}\n"
-                f"Stop:   {signal.stop:.4f}\n"
-                f"Target: {signal.target:.4f}\n"
-                f"BE at:  {signal.be_level:.4f}\n"
+                f"Entry:  {avg_price:.5f}\n"
+                f"Stop:   {signal.stop:.5f}\n"
+                f"Target: {signal.target:.5f}\n"
                 f"Size:   {size} contracts\n"
+                f"Risk:   ${risk_actual:.3f}\n"
                 f"RR:     1:{RR_RATIO}\n"
                 f"Reason: {signal.reason}"
             )
@@ -604,7 +540,6 @@ class BitgetBot:
             for sym in list(self.active_positions.keys()):
                 if sym not in live:
                     pos = self.active_positions.pop(sym)
-                    # Try to get closed PnL
                     pnl = 0.0
                     try:
                         history = await self.exchange.fetch_closed_orders(sym, limit=5)
@@ -614,10 +549,18 @@ class BitgetBot:
                         pass
 
                     if pnl < 0:
-                        self.consec_losses  += 1
-                        self.losses_today   += 1
+                        self.consec_losses += 1
+                        self.losses_today  += 1
+                        # Trigger pause if consecutive losses hit limit
+                        if self.consec_losses >= MAX_CONSEC_LOSSES:
+                            self.pause_until = time.time() + (CONSEC_LOSS_PAUSE_HR * 3600)
+                            await self.tg(
+                                f"⏸ {MAX_CONSEC_LOSSES} consecutive losses — "
+                                f"pausing {CONSEC_LOSS_PAUSE_HR}h to protect balance"
+                            )
                     else:
-                        self.consec_losses   = 0
+                        self.consec_losses = 0
+
                     self.profit_today = round(self.profit_today + pnl, 4)
 
                     self._save_trade({
@@ -635,41 +578,24 @@ class BitgetBot:
                         f"{'✅ WIN' if pnl >= 0 else '❌ LOSS'} {sym_clean}\n"
                         f"PnL: {pnl:+.4f} USDT\n"
                         f"Today: {self.profit_today:+.4f} USDT | "
-                        f"Streak: {self.consec_losses}"
+                        f"Streak: {self.consec_losses}/{MAX_CONSEC_LOSSES}"
                     )
-
-                # Breakeven check
-                elif sym in self.active_positions:
-                    pos = self.active_positions[sym]
-                    if not pos.get("be_moved"):
-                        try:
-                            ticker = await self.exchange.fetch_ticker(sym)
-                            price  = float(ticker.get("last", 0))
-                            if pos["side"] == "buy"  and price >= pos["be_level"]:
-                                pos["be_moved"] = True
-                                logger.info(f"BE: {sym} SL moved to entry {pos['entry']}")
-                                await self.tg(f"🔒 {sym.replace('/USDT:USDT','')} SL moved to breakeven ({pos['entry']:.4f})")
-                            elif pos["side"] == "sell" and price <= pos["be_level"]:
-                                pos["be_moved"] = True
-                                logger.info(f"BE: {sym} SL moved to entry {pos['entry']}")
-                                await self.tg(f"🔒 {sym.replace('/USDT:USDT','')} SL moved to breakeven ({pos['entry']:.4f})")
-                        except Exception:
-                            pass
 
         except Exception as e:
             logger.warning(f"Reconcile error: {e}")
 
     async def scan_symbol(self, symbol, stagger=0):
         await asyncio.sleep(stagger)
-        # Mark as initializing immediately so status shows something
         self.market_debug[symbol] = {"time": time.time(), "why": "Initializing...", "signal": None}
+
         while self.is_scanning:
             try:
                 await asyncio.sleep(SCAN_INTERVAL_SEC)
                 self._reset_daily()
 
                 if not self.exchange:
-                    self.market_debug[symbol] = {"time": time.time(), "why": "Not connected — press CONNECT", "signal": None}
+                    self.market_debug[symbol] = {
+                        "time": time.time(), "why": "Not connected", "signal": None}
                     await asyncio.sleep(5)
                     continue
 
@@ -682,23 +608,22 @@ class BitgetBot:
                         "time": time.time(), "why": gate, "signal": None}
                     continue
 
-                self.market_debug[symbol] = {"time": time.time(), "why": "Fetching candles...", "signal": None}
+                self.market_debug[symbol] = {
+                    "time": time.time(), "why": "Fetching candles...", "signal": None}
 
-                # Fetch candles sequentially to avoid rate limits
-                c15 = await self.fetch_ohlcv(symbol, TF_TREND,   CANDLES_15M)
+                # Sequential fetch to avoid rate limits
+                c15 = await self.fetch_ohlcv(symbol, TF_TREND, CANDLES_15M)
                 await asyncio.sleep(0.3)
-                c5  = await self.fetch_ohlcv(symbol, TF_SETUP,   CANDLES_5M)
-                await asyncio.sleep(0.3)
-                c1  = await self.fetch_ohlcv(symbol, TF_TRIGGER, CANDLES_1M)
+                c5  = await self.fetch_ohlcv(symbol, TF_ENTRY,  CANDLES_5M)
 
-                if not c15 or not c5 or not c1:
+                if not c15 or not c5:
                     self.market_debug[symbol] = {
                         "time": time.time(),
-                        "why": f"Candle fetch failed — 15M:{len(c15)} 5M:{len(c5)} 1M:{len(c1)}. Check API connection.",
+                        "why": f"Candle fetch failed — 15M:{len(c15)} 5M:{len(c5)}. Check API.",
                         "signal": None}
                     continue
 
-                signal, reason, dbg = self.build_signal(symbol, c15, c5, c1)
+                signal, reason, dbg = self.build_signal(symbol, c15, c5)
                 dbg["time"]   = time.time()
                 dbg["why"]    = reason
                 dbg["signal"] = signal.side.upper() if signal else None
@@ -748,32 +673,27 @@ def keyboard():
 
 def fmt_debug(sym, d):
     if not d:
-        return f"📍 {sym.replace('/USDT:USDT','')} ⏳ No data yet"
-    age     = int(time.time() - d.get("time", time.time()))
-    signal  = d.get("signal") or "—"
-    why     = d.get("why", "—")
-    trend   = d.get("trend", "—")
-    e50_15  = d.get("ema50_15", "—")
-    e200_15 = d.get("ema200_15", "—")
-    slp15   = d.get("15m_slope", 0)
-    e20_5   = d.get("ema20_5", "—")
-    e50_5   = d.get("ema50_5", "—")
-    slp5    = d.get("5m_slope", 0)
-    rsi     = d.get("rsi5", "—")
-    rsi_ok  = "✅" if d.get("rsi_ok") else "❌"
-    spr_ok  = "✅" if d.get("spread_ok") else "❌"
-    pb_b    = "✅" if d.get("pb_touch_bull") else "⏳"
-    pb_s    = "✅" if d.get("pb_touch_bear") else "⏳"
-    pat     = d.get("pattern", "—")
-    body_ok = "✅" if d.get("body_ok") else "❌"
-    spk_ok  = "✅" if d.get("spike_ok", True) else "❌ Spike"
-    sym_c   = sym.replace("/USDT:USDT", "")
+        return f"📍 {sym.replace('/USDT:USDT','')} ⏳ No data yet\n"
+    age      = int(time.time() - d.get("time", time.time()))
+    signal   = d.get("signal") or "—"
+    why      = d.get("why", "—")
+    trend    = d.get("trend", "—")
+    ema200   = d.get("ema200_15", "—")
+    slope    = d.get("ema_slope", 0)
+    dist_pct = d.get("ema_dist_pct", "—")
+    dist_ok  = "✅" if d.get("dist_ok") else "❌"
+    candle_ok= "✅" if d.get("candle_ok") else "❌"
+    bull_b   = "✅" if d.get("bull_break") else "⏳"
+    bear_b   = "✅" if d.get("bear_break") else "⏳"
+    body_ok  = "✅" if d.get("body_ok") else "❌"
+    range_ok = "✅" if d.get("range_ok") else "❌"
+    sym_c    = sym.replace("/USDT:USDT", "")
     return (
         f"📍 {sym_c} ({age}s)\n"
-        f"15M: {trend} | EMA50:{e50_15} EMA200:{e200_15} Slope:{slp15:.5f}\n"
-        f"5M:  EMA20:{e20_5} EMA50:{e50_5} Slope:{slp5:.5f}\n"
-        f"5M:  RSI:{rsi} {rsi_ok} | Spread:{spr_ok} | PB Bull:{pb_b} Bear:{pb_s}\n"
-        f"1M:  {pat} | Body:{body_ok} | Spike:{spk_ok}\n"
+        f"15M: {trend} | EMA200:{ema200} Slope:{slope:.5f}\n"
+        f"Dist: {dist_pct}% {dist_ok} | 15M Candle:{candle_ok}\n"
+        f"5M:  Break Bull:{bull_b} Bear:{bear_b}\n"
+        f"5M:  Body:{body_ok} | Range:{range_ok}\n"
         f"Signal: {signal} | {why}\n"
     )
 
@@ -804,12 +724,10 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             keyboard())
 
     elif q.data == "TESTNET":
-        import os
         os.environ["BITGET_TESTNET"] = "true"
         await safe_edit(q, "🧪 Switched to TESTNET — reconnect to apply", keyboard())
 
     elif q.data == "LIVE":
-        import os
         os.environ["BITGET_TESTNET"] = "false"
         await safe_edit(q, "💰 Switched to LIVE — reconnect to apply", keyboard())
 
@@ -819,13 +737,14 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         bot.is_scanning = True
         for i, sym in enumerate(SYMBOLS):
-            asyncio.create_task(bot.scan_symbol(sym, stagger=i*5))
+            asyncio.create_task(bot.scan_symbol(sym, stagger=i * 5))
         await safe_edit(q,
             f"🔍 Scanner active\n"
-            f"Pairs: BTC ETH SOL\n"
-            f"Strategy: 15M/5M/1M Pullback\n"
+            f"Pairs: SOL DOGE XRP\n"
+            f"Strategy: 15M EMA200 + 5M Breakout\n"
+            f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
             f"RR: 1:{RR_RATIO} | Leverage: {LEVERAGE}x\n"
-            f"Risk/trade: {RISK_PER_TRADE:.1%}",
+            f"Risk/trade: ${RISK_PER_TRADE:.2f} fixed",
             keyboard())
 
     elif q.data == "STOP":
@@ -837,9 +756,9 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, "⏸ Paused 24h", keyboard())
 
     elif q.data == "RESUME":
-        bot.pause_until = 0
+        bot.pause_until   = 0
         bot.consec_losses = 0
-        await safe_edit(q, "▶️ Resumed", keyboard())
+        await safe_edit(q, "▶️ Resumed — consecutive loss counter reset", keyboard())
 
     elif q.data == "STATUS":
         now = time.time()
@@ -854,9 +773,14 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for sym, pos in bot.active_positions.items():
             sym_c = sym.replace("/USDT:USDT", "")
             age   = int(time.time() - pos["opened_at"])
-            open_pos += (f"\n🔵 {sym_c} {pos['side'].upper()} @ {pos['entry']:.4f} "
-                         f"| SL:{pos['stop']:.4f} TP:{pos['target']:.4f} "
-                         f"| {'🔒 BE' if pos.get('be_moved') else '⏳'} ({age}s)")
+            open_pos += (
+                f"\n🔵 {sym_c} {pos['side'].upper()} @ {pos['entry']:.5f} "
+                f"| SL:{pos['stop']:.5f} TP:{pos['target']:.5f} "
+                f"| ({age}s)"
+            )
+
+        session_active = is_session_active()
+        utc_hour = datetime.utcnow().hour
 
         header = (
             f"🕒 {now_wat()}\n"
@@ -864,10 +788,11 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{'🧪 TESTNET' if USE_TESTNET else '💰 LIVE'}\n"
             f"💰 Balance: {bot.balance_usdt:.2f} USDT\n"
             f"📈 PnL Today: {bot.profit_today:+.4f} USDT\n"
-            f"🎯 RR 1:{RR_RATIO} | Risk {RISK_PER_TRADE:.1%} | {LEVERAGE}x\n"
+            f"🎯 RR 1:{RR_RATIO} | Risk ${RISK_PER_TRADE:.2f} | {LEVERAGE}x\n"
             f"📉 Streak: {bot.consec_losses}/{MAX_CONSEC_LOSSES} | "
             f"Trades: {bot.trades_today}/{MAX_TRADES_PER_DAY}\n"
-                f"🚦 Gate: {gate}"
+            f"🕐 Session: {'✅ ACTIVE' if session_active else f'❌ CLOSED ({utc_hour:02d}:00 UTC)'}\n"
+            f"🚦 Gate: {gate}"
         )
 
         if open_pos:
@@ -883,10 +808,11 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot._chat_ids.add(update.message.chat_id)
     await update.message.reply_text(
         "💎 Bitget Crypto Futures Bot\n"
-        "Strategy: 15M trend + 5M pullback + 1M entry\n"
-        "Pairs: BTC ETH SOL perpetuals\n"
+        "Strategy: 15M EMA200 Trend + 5M Breakout\n"
+        "Pairs: SOL DOGE XRP perpetuals\n"
         f"RR: 1:{RR_RATIO} | Leverage: {LEVERAGE}x\n"
-        f"Risk/trade: {RISK_PER_TRADE:.1%}\n"
+        f"Risk/trade: ${RISK_PER_TRADE:.2f} fixed\n"
+        f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
         "1. Press CONNECT\n"
         "2. Press START\n"
         "3. Press STATUS to monitor",

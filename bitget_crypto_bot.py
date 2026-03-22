@@ -43,7 +43,7 @@ BITGET_SECRET     = "e2bf8eed9bc0f4963d4c2c325ba19eb03476f9b504341217bbbe7343c80
 BITGET_PASSPHRASE = "Salome1234"
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "8697638086:AAG00D0RXUAqXFTjy8-4XO4Bka2kBamo-VA")
 
-USE_TESTNET = os.getenv("BITGET_TESTNET", "true").lower() == "true"
+USE_TESTNET = False  # Live mode only
 
 # ========================= MARKETS =========================
 SYMBOLS = ["SOL/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"]
@@ -207,11 +207,9 @@ class BitgetBot:
                 "enableRateLimit": True,
                 "options":  {"defaultType": "swap"},
             })
-            if USE_TESTNET:
-                self.exchange.set_sandbox_mode(True)
             await self.exchange.load_markets()
             await self.fetch_balance()
-            logger.info(f"Connected to Bitget {'TESTNET' if USE_TESTNET else 'LIVE'}")
+            logger.info(f"Connected to Bitget LIVE")
             return True
         except Exception as e:
             logger.error(f"Connect failed: {e}")
@@ -264,13 +262,26 @@ class BitgetBot:
         return True, "OK"
 
     async def fetch_ohlcv(self, symbol, tf, limit):
-        try:
-            data = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-            # Drop last (open/unconfirmed) candle
-            return data[:-1] if len(data) > 1 else data
-        except Exception as e:
-            logger.warning(f"OHLCV {symbol} {tf}: {e}")
-            return []
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                data = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+                if not data:
+                    logger.warning(f"OHLCV {symbol} {tf}: Empty response (attempt {attempt}/{max_retries})")
+                    await asyncio.sleep(2 * attempt)
+                    continue
+                # Drop last (open/unconfirmed) candle
+                return data[:-1] if len(data) > 1 else data
+            except Exception as e:
+                err = str(e)
+                logger.warning(f"OHLCV {symbol} {tf} attempt {attempt}/{max_retries}: {err}")
+                # Rate limit — wait longer
+                if "rate limit" in err.lower() or "429" in err:
+                    await asyncio.sleep(5 * attempt)
+                elif attempt < max_retries:
+                    await asyncio.sleep(2 * attempt)
+        logger.error(f"OHLCV {symbol} {tf}: All {max_retries} attempts failed")
+        return []
 
     def build_signal(self, symbol, c15, c5):
         """
@@ -617,10 +628,18 @@ class BitgetBot:
                 c5  = await self.fetch_ohlcv(symbol, TF_ENTRY,  CANDLES_5M)
 
                 if not c15 or not c5:
+                    fail_reason = []
+                    if not c15:
+                        fail_reason.append(f"15M: 0 candles")
+                    if not c5:
+                        fail_reason.append(f"5M: 0 candles")
+                    msg = " | ".join(fail_reason) + " — possible rate limit. Retrying..."
+                    logger.warning(f"{symbol}: {msg}")
                     self.market_debug[symbol] = {
                         "time": time.time(),
-                        "why": f"Candle fetch failed — 15M:{len(c15)} 5M:{len(c5)}. Check API.",
+                        "why": msg,
                         "signal": None}
+                    await asyncio.sleep(10)
                     continue
 
                 signal, reason, dbg = self.build_signal(symbol, c15, c5)
@@ -666,8 +685,6 @@ def keyboard():
         [InlineKeyboardButton("🔌 CONNECT", callback_data="CONNECT")],
         [InlineKeyboardButton("⏸ PAUSE",   callback_data="PAUSE"),
          InlineKeyboardButton("▶️ RESUME",  callback_data="RESUME")],
-        [InlineKeyboardButton("🧪 TESTNET", callback_data="TESTNET"),
-         InlineKeyboardButton("💰 LIVE",    callback_data="LIVE")],
     ])
 
 
@@ -719,17 +736,9 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ok = await bot.connect()
         await safe_edit(q,
             f"{'✅ Connected' if ok else '❌ Failed'} | "
-            f"{'TESTNET' if USE_TESTNET else 'LIVE'} | "
+            f"LIVE | "
             f"Balance: {bot.balance_usdt:.2f} USDT",
             keyboard())
-
-    elif q.data == "TESTNET":
-        os.environ["BITGET_TESTNET"] = "true"
-        await safe_edit(q, "🧪 Switched to TESTNET — reconnect to apply", keyboard())
-
-    elif q.data == "LIVE":
-        os.environ["BITGET_TESTNET"] = "false"
-        await safe_edit(q, "💰 Switched to LIVE — reconnect to apply", keyboard())
 
     elif q.data == "START":
         if not bot.exchange:
@@ -737,7 +746,7 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         bot.is_scanning = True
         for i, sym in enumerate(SYMBOLS):
-            asyncio.create_task(bot.scan_symbol(sym, stagger=i * 5))
+            asyncio.create_task(bot.scan_symbol(sym, stagger=i * 12))
         await safe_edit(q,
             f"🔍 Scanner active\n"
             f"Pairs: SOL DOGE XRP\n"
@@ -784,8 +793,7 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         header = (
             f"🕒 {now_wat()}\n"
-            f"🤖 {'ACTIVE' if bot.is_scanning else 'OFFLINE'} | "
-            f"{'🧪 TESTNET' if USE_TESTNET else '💰 LIVE'}\n"
+            f"🤖 {'ACTIVE' if bot.is_scanning else 'OFFLINE'} | 💰 LIVE\n"
             f"💰 Balance: {bot.balance_usdt:.2f} USDT\n"
             f"📈 PnL Today: {bot.profit_today:+.4f} USDT\n"
             f"🎯 RR 1:{RR_RATIO} | Risk ${RISK_PER_TRADE:.2f} | {LEVERAGE}x\n"

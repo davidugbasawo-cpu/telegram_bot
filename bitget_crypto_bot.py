@@ -523,7 +523,10 @@ class BitgetBot:
 
     async def set_leverage(self, symbol):
         try:
-            await self.exchange.set_leverage(LEVERAGE, symbol)
+            await self.exchange.set_leverage(
+                LEVERAGE, symbol,
+                params={"marginMode": "crossed"}
+            )
         except Exception as e:
             logger.warning(f"Leverage set failed {symbol}: {e}")
 
@@ -552,38 +555,55 @@ class BitgetBot:
             return
 
         opposite = "sell" if signal.side == "buy" else "buy"
+
         try:
-            # Market entry
+            # ── ENTRY ──────────────────────────────────────────
             entry_order = await self.exchange.create_order(
-                symbol=signal.symbol, type="market",
-                side=signal.side, amount=size,
-                params={"marginMode": "cross"}
+                symbol=signal.symbol,
+                type="market",
+                side=signal.side,
+                amount=size,
+                params={"marginMode": "crossed"}
             )
             avg_price = float(entry_order.get("average") or entry_order.get("price") or signal.entry)
 
-            # Stop loss
-            await self.exchange.create_order(
-                symbol=signal.symbol, type="stop_market",
-                side=opposite, amount=size,
-                params={
-                    "stopPrice": signal.stop,
-                    "triggerPrice": signal.stop,
-                    "reduceOnly": True,
-                    "marginMode": "cross",
-                }
-            )
+            await asyncio.sleep(0.5)
 
-            # Take profit
-            await self.exchange.create_order(
-                symbol=signal.symbol, type="take_profit_market",
-                side=opposite, amount=size,
-                params={
-                    "stopPrice": signal.target,
-                    "triggerPrice": signal.target,
-                    "reduceOnly": True,
-                    "marginMode": "cross",
-                }
-            )
+            # ── STOP LOSS ──────────────────────────────────────
+            try:
+                await self.exchange.create_order(
+                    symbol=signal.symbol,
+                    type="stop_market",
+                    side=opposite,
+                    amount=size,
+                    params={
+                        "stopPrice":  signal.stop,
+                        "reduceOnly": True,
+                        "marginMode": "crossed",
+                    }
+                )
+            except Exception as sl_err:
+                logger.warning(f"SL order failed {signal.symbol}: {sl_err} — trade open without SL")
+                await self.tg(f"⚠️ SL order failed for {signal.symbol.replace('/USDT:USDT','')} — close manually if needed")
+
+            await asyncio.sleep(0.5)
+
+            # ── TAKE PROFIT ────────────────────────────────────
+            try:
+                await self.exchange.create_order(
+                    symbol=signal.symbol,
+                    type="take_profit_market",
+                    side=opposite,
+                    amount=size,
+                    params={
+                        "stopPrice":  signal.target,
+                        "reduceOnly": True,
+                        "marginMode": "crossed",
+                    }
+                )
+            except Exception as tp_err:
+                logger.warning(f"TP order failed {signal.symbol}: {tp_err} — trade open without TP")
+                await self.tg(f"⚠️ TP order failed for {signal.symbol.replace('/USDT:USDT','')} — close manually if needed")
 
             self.active_positions[signal.symbol] = {
                 "side":      signal.side,
@@ -596,7 +616,7 @@ class BitgetBot:
             self.trades_today   += 1
             self.cooldown_until  = time.time() + COOLDOWN_SEC
 
-            sym_clean = signal.symbol.replace("/USDT:USDT", "")
+            sym_clean   = signal.symbol.replace("/USDT:USDT", "")
             risk_actual = abs(avg_price - signal.stop) * size
             await self.tg(
                 f"🚀 {sym_clean} {signal.side.upper()}\n"

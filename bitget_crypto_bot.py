@@ -1,23 +1,22 @@
 """
 Bitget Crypto Futures Bot
-Strategy: 15M Trend + 5M Breakout with Chop Filter
-  15M → trend direction (EMA 200 only)
-  5M  → breakout entry (previous candle high/low break + body strength + range filter)
-Pairs: SOL/USDT:USDT, DOGE/USDT:USDT, XRP/USDT:USDT perpetual futures
+Strategy: Binary Trend Pullback (15M Trend + 5M Pullback Entry)
+  15M → trend direction (EMA 50)
+  5M  → pullback to EMA 50 + strong candle + ADX + RSI + Volume
+Pairs: BTC/USDT:USDT, ETH/USDT:USDT, SOL/USDT:USDT perpetual futures
 
-Changes from previous version:
-- Simplified to EMA 200 only (removed EMA50, RSI, MACD etc.)
-- New chop filter: EMA distance + trend clarity + 15M candle strength
-- New entry: 5M breakout of previous candle high/low
-- Body >= 50% of candle range required
-- 5M sideways filter: breakout candle range >= avg of last 10 candles
-- Session filter: only trade during active sessions (UTC)
-- Precise EMA distance rule: price must be >= 0.5% from EMA200
-- Minimum SL distance: >= 0.15% of entry price
+Strategy rules:
+- 15M EMA 50: price above = BUY only | price below = SELL only
+- ADX (14) > 25: trend must be strong, skip if choppy
+- RSI (14): BUY requires RSI > 50 | SELL requires RSI < 50
+- 5M pullback: price retraces toward EMA 50 then strong candle fires
+- Candle body >= 50% of range (no doji)
+- Volume: entry candle must be above average volume
+- Session filter: London + New York sessions only (UTC)
+- RR: 1:4
+- Fixed risk: $0.25 per trade
 - Daily trade limit: 6
 - Consecutive loss pause: 3 losses = 2 hour pause
-- Fixed risk: $0.25 per trade
-- RR: 1:3
 """
 
 import asyncio
@@ -46,38 +45,37 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "8697638086:AAG00D0RXUAqXFTjy8-4
 USE_TESTNET = False  # Live mode only
 
 # ========================= MARKETS =========================
-SYMBOLS = ["SOL/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"]
+SYMBOLS = ["SOL/USDT:USDT", "XRP/USDT:USDT", "ADA/USDT:USDT"]
 
 # ========================= TIMEFRAMES =========================
-TF_TREND   = "15m"
-TF_ENTRY   = "5m"
-CANDLES_15M = 250
-CANDLES_5M  = 60
+TF_TREND    = "15m"
+TF_ENTRY    = "5m"
+CANDLES_15M = 150
+CANDLES_5M  = 80
 
-# ========================= INDICATOR =========================
-EMA_PERIOD = 200   # Only one EMA — keep it simple
+# ========================= INDICATORS =========================
+EMA_PERIOD    = 50    # EMA 50 for trend direction
+ADX_PERIOD    = 14    # ADX period
+ADX_MIN       = 25    # ADX must be > 25 (strong trend)
+RSI_PERIOD    = 14    # RSI period
+VOLUME_LOOKBACK = 20  # Candles to calculate average volume
 
-# ========================= CHOP FILTER =========================
-EMA_DISTANCE_MIN_PCT  = 0.005   # Price must be >= 0.5% from EMA200 on 15M
-CANDLE_BODY_RATIO_MIN = 0.50    # 15M last candle body must be >= 50% of range
-SLOPE_LOOKBACK        = 5       # Candles to measure EMA200 slope direction
-
-# ========================= ENTRY FILTER =========================
-BREAKOUT_BODY_MIN     = 0.50    # 5M breakout candle body >= 50% of range
-SIDEWAYS_LOOKBACK     = 10      # Candles to calculate avg range for sideways filter
+# ========================= PULLBACK FILTER =========================
+PULLBACK_ZONE_PCT     = 0.003   # Price must come within 0.3% of EMA50 on 5M
+CANDLE_BODY_RATIO_MIN = 0.50    # Entry candle body >= 50% of range
+SLOPE_LOOKBACK        = 5       # Candles to measure EMA50 slope
 
 # ========================= SESSION FILTER =========================
-# Only trade during active market hours (UTC)
-# London/NY overlap: 12:00-16:00 UTC
-# New York session:  13:00-21:00 UTC
-SESSION_START_UTC = 12   # 12:00 UTC
+# London session: 08:00-16:00 UTC
+# New York session: 13:00-21:00 UTC
+SESSION_START_UTC = 8    # 08:00 UTC
 SESSION_END_UTC   = 21   # 21:00 UTC
 
 # ========================= RISK =========================
-RISK_PER_TRADE    = 0.25   # Fixed $0.25 per trade
-LEVERAGE          = 3
-RR_RATIO          = 3.0    # 1:3 risk/reward
-MIN_SL_PCT        = 0.0015 # Minimum SL distance = 0.15% of entry
+RISK_PER_TRADE = 0.25   # Fixed $0.25 per trade
+LEVERAGE       = 3
+RR_RATIO       = 4.0    # 1:4 risk/reward
+MIN_SL_PCT     = 0.0015 # Minimum SL distance = 0.15% of entry
 
 # ========================= LIMITS =========================
 MAX_TRADES_PER_DAY   = 6
@@ -124,6 +122,69 @@ def candle_body_ratio(candle):
     if rng == 0:
         return 0.0
     return abs(candle[4] - candle[1]) / rng  # |close - open| / range
+
+
+def rsi_value(closes, period=14):
+    """Calculate RSI from closes list"""
+    closes = np.array(closes, dtype=float)
+    if len(closes) < period + 1:
+        return None
+    deltas = np.diff(closes)
+    gains  = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain = float(np.mean(gains[:period]))
+    avg_loss = float(np.mean(losses[:period]))
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return float(100 - (100 / (1 + rs)))
+
+
+def adx_value(candles, period=14):
+    """Calculate ADX from candles list [[ts,o,h,l,c,v],...]"""
+    if len(candles) < period * 2 + 1:
+        return None
+    highs  = np.array([c[2] for c in candles], dtype=float)
+    lows   = np.array([c[3] for c in candles], dtype=float)
+    closes = np.array([c[4] for c in candles], dtype=float)
+
+    tr_list, pdm_list, ndm_list = [], [], []
+    for i in range(1, len(candles)):
+        h, l, pc = highs[i], lows[i], closes[i - 1]
+        tr  = max(h - l, abs(h - pc), abs(l - pc))
+        pdm = max(h - highs[i - 1], 0) if (h - highs[i - 1]) > (lows[i - 1] - l) else 0
+        ndm = max(lows[i - 1] - l, 0) if (lows[i - 1] - l) > (h - highs[i - 1]) else 0
+        tr_list.append(tr)
+        pdm_list.append(pdm)
+        ndm_list.append(ndm)
+
+    def smooth(arr, p):
+        s = sum(arr[:p])
+        out = [s]
+        for v in arr[p:]:
+            s = s - s / p + v
+            out.append(s)
+        return out
+
+    atr  = smooth(tr_list,  period)
+    apdm = smooth(pdm_list, period)
+    andm = smooth(ndm_list, period)
+
+    dx_list = []
+    for i in range(len(atr)):
+        pdi = 100 * apdm[i] / atr[i] if atr[i] else 0
+        ndi = 100 * andm[i] / atr[i] if atr[i] else 0
+        dsum = pdi + ndi
+        dx   = 100 * abs(pdi - ndi) / dsum if dsum else 0
+        dx_list.append(dx)
+
+    if len(dx_list) < period:
+        return None
+    adx = float(np.mean(dx_list[-period:]))
+    return adx
 
 
 def is_session_active():
@@ -288,13 +349,14 @@ class BitgetBot:
         Returns (Signal | None, reason_str, debug_dict)
 
         Logic:
-        1. 15M EMA200 direction → trend
-        2. Chop filter: EMA distance + slope + last 15M candle body
-        3. 5M: breakout of previous candle high (BUY) or low (SELL)
-        4. Breakout candle body >= 50%
-        5. Breakout candle range >= avg of last 10 candles (sideways filter)
-        6. SL below/above previous 5M candle
-        7. Min SL distance check
+        1. 15M EMA 50 direction → trend (UP/DOWN)
+        2. 15M ADX > 25 → trend is strong enough
+        3. 5M: price pulled back to within 0.3% of EMA 50
+        4. 5M: strong candle fires in trend direction (body >= 50%)
+        5. 5M: RSI > 50 for BUY | RSI < 50 for SELL
+        6. 5M: entry candle volume > average volume
+        7. SL: below/above entry candle low/high
+        8. TP: entry + risk * 4 (1:4 RR)
         """
         dbg = {}
 
@@ -302,104 +364,99 @@ class BitgetBot:
         if len(c15) < EMA_PERIOD + SLOPE_LOOKBACK + 5:
             return None, "15M warming up", dbg
 
-        cl15 = [x[4] for x in c15]
-        last_15 = c15[-1]
+        cl15   = [x[4] for x in c15]
         price15 = cl15[-1]
 
-        ema200_series = ema_series(cl15, EMA_PERIOD)
-        if not ema200_series or ema200_series[-1] is None:
-            return None, "EMA200 not ready", dbg
+        ema50_15 = ema_value(cl15, EMA_PERIOD)
+        if ema50_15 is None:
+            return None, "EMA50 not ready", dbg
 
-        ema200 = ema200_series[-1]
+        # Slope check
+        ema50_old = ema_value(cl15[:-SLOPE_LOOKBACK], EMA_PERIOD)
+        ema_slope = (ema50_15 - ema50_old) if ema50_old else 0.0
 
-        # EMA200 slope — compare current vs N candles ago
-        old_ema = None
-        for val in reversed(ema200_series[-(SLOPE_LOOKBACK+2):-1]):
-            if val is not None:
-                old_ema = val
-                break
-        ema_slope = (ema200 - old_ema) if old_ema else 0.0
+        trend_up   = price15 > ema50_15 and ema_slope > 0
+        trend_down = price15 < ema50_15 and ema_slope < 0
 
-        trend_up   = price15 > ema200 and ema_slope > 0
-        trend_down = price15 < ema200 and ema_slope < 0
-
-        dbg["ema200_15"]  = round(ema200, 5)
-        dbg["price15"]    = round(price15, 5)
-        dbg["ema_slope"]  = round(ema_slope, 6)
-        dbg["trend"]      = "UP" if trend_up else "DOWN" if trend_down else "SIDE"
+        dbg["ema50_15"] = round(ema50_15, 5)
+        dbg["price15"]  = round(price15, 5)
+        dbg["ema_slope"]= round(ema_slope, 6)
+        dbg["trend"]    = "UP" if trend_up else "DOWN" if trend_down else "SIDE"
 
         if not trend_up and not trend_down:
-            return None, f"15M sideways | Price:{price15:.4f} EMA200:{ema200:.4f}", dbg
+            return None, f"15M sideways | Price:{price15:.4f} EMA50:{ema50_15:.4f}", dbg
 
-        # ── CHOP FILTER ────────────────────────────────────
-        # 1. EMA distance — price must be >= 0.5% from EMA200
-        ema_dist_pct = abs(price15 - ema200) / ema200
-        dist_ok = ema_dist_pct >= EMA_DISTANCE_MIN_PCT
+        # ── ADX FILTER (15M) ───────────────────────────────
+        adx = adx_value(c15, ADX_PERIOD)
+        adx_ok = adx is not None and adx > ADX_MIN
+        dbg["adx"]    = round(adx, 2) if adx else "N/A"
+        dbg["adx_ok"] = adx_ok
 
-        # 2. EMA slope must not be flat (already embedded in trend_up/down)
-        slope_ok = ema_slope != 0.0
-
-        # 3. Last 15M candle must have body >= 50% of range (no doji)
-        last_15_body = candle_body_ratio(last_15)
-        candle_ok = last_15_body >= CANDLE_BODY_RATIO_MIN
-
-        dbg["ema_dist_pct"]  = round(ema_dist_pct * 100, 3)
-        dbg["dist_ok"]       = dist_ok
-        dbg["candle_ok"]     = candle_ok
-        dbg["last_15_body"]  = round(last_15_body, 2)
-
-        if not dist_ok:
-            return None, f"Price too close to EMA200 ({ema_dist_pct*100:.2f}% < 0.5%)", dbg
-        if not candle_ok:
-            return None, f"Weak 15M candle — body {last_15_body:.2f} < 0.50 (doji/indecision)", dbg
+        if not adx_ok:
+            return None, f"ADX too low ({dbg['adx']} <= {ADX_MIN}) — market choppy", dbg
 
         # ── 5M ENTRY ───────────────────────────────────────
-        if len(c5) < SIDEWAYS_LOOKBACK + 3:
+        if len(c5) < RSI_PERIOD + VOLUME_LOOKBACK + 5:
             return None, "5M warming up", dbg
 
-        prev5 = c5[-2]   # Previous confirmed candle
-        cur5  = c5[-1]   # Current forming candle (last confirmed)
+        cl5   = [x[4] for x in c5]
+        vol5  = [x[5] for x in c5]
+        cur5  = c5[-1]
+        prev5 = c5[-2]
 
-        prev_high = prev5[2]
-        prev_low  = prev5[3]
         cur_open  = cur5[1]
-        cur_close = cur5[4]
         cur_high  = cur5[2]
         cur_low   = cur5[3]
+        cur_close = cur5[4]
+        cur_vol   = cur5[5]
 
-        # Breakout check
-        bull_breakout = cur_close > prev_high and cur_open <= prev_high
-        bear_breakout = cur_close < prev_low  and cur_open >= prev_low
+        # EMA 50 on 5M for pullback zone
+        ema50_5m = ema_value(cl5, EMA_PERIOD)
+        if ema50_5m is None:
+            return None, "5M EMA50 not ready", dbg
 
-        # Breakout candle body ratio
+        # RSI on 5M
+        rsi = rsi_value(cl5, RSI_PERIOD)
+        rsi_ok_buy  = rsi is not None and rsi > 50
+        rsi_ok_sell = rsi is not None and rsi < 50
+
+        # Volume filter — current candle volume > average of last N candles
+        avg_vol  = float(np.mean(vol5[-(VOLUME_LOOKBACK + 1):-1])) if len(vol5) > VOLUME_LOOKBACK else 0
+        vol_ok   = avg_vol == 0 or cur_vol > avg_vol
+
+        # Candle body
         cur_body = candle_body_ratio(cur5)
-        body_ok  = cur_body >= BREAKOUT_BODY_MIN
+        body_ok  = cur_body >= CANDLE_BODY_RATIO_MIN
 
-        # Sideways filter — current candle range vs average of last N candles
-        recent_ranges = [abs(c[2] - c[3]) for c in c5[-(SIDEWAYS_LOOKBACK+2):-2]]
-        avg_range     = sum(recent_ranges) / len(recent_ranges) if recent_ranges else 0
-        cur_range     = abs(cur_high - cur_low)
-        range_ok      = avg_range == 0 or cur_range >= avg_range
+        # Candle direction
+        bull_candle = cur_close > cur_open
+        bear_candle = cur_close < cur_open
 
-        dbg["prev_high"]    = round(prev_high, 5)
-        dbg["prev_low"]     = round(prev_low, 5)
-        dbg["bull_break"]   = bull_breakout
-        dbg["bear_break"]   = bear_breakout
-        dbg["cur_body"]     = round(cur_body, 2)
-        dbg["body_ok"]      = body_ok
-        dbg["range_ok"]     = range_ok
-        dbg["cur_range"]    = round(cur_range, 5)
-        dbg["avg_range"]    = round(avg_range, 5)
+        # Pullback check — previous candle came within 0.3% of 5M EMA50
+        prev_low  = prev5[3]
+        prev_high = prev5[2]
+        pullback_bull = abs(prev_low  - ema50_5m) / ema50_5m <= PULLBACK_ZONE_PCT
+        pullback_bear = abs(prev_high - ema50_5m) / ema50_5m <= PULLBACK_ZONE_PCT
+
+        dbg["ema50_5m"]      = round(ema50_5m, 5)
+        dbg["rsi"]           = round(rsi, 2) if rsi else "N/A"
+        dbg["rsi_ok_buy"]    = rsi_ok_buy
+        dbg["rsi_ok_sell"]   = rsi_ok_sell
+        dbg["vol_ok"]        = vol_ok
+        dbg["cur_vol"]       = round(cur_vol, 2)
+        dbg["avg_vol"]       = round(avg_vol, 2)
+        dbg["body_ok"]       = body_ok
+        dbg["pullback_bull"] = pullback_bull
+        dbg["pullback_bear"] = pullback_bear
 
         # ── LONG SETUP ─────────────────────────────────────
-        if trend_up and bull_breakout and body_ok and range_ok:
+        if trend_up and pullback_bull and bull_candle and body_ok and rsi_ok_buy and vol_ok:
             entry = float(cur_close)
-            stop  = float(prev_low)
+            stop  = float(cur_low)
 
-            # Minimum SL distance check
             min_sl = entry * MIN_SL_PCT
             if (entry - stop) < min_sl:
-                return None, f"SL too tight ({entry-stop:.5f} < min {min_sl:.5f})", dbg
+                stop = entry - min_sl
 
             if stop >= entry:
                 return None, "Invalid long SL >= entry", dbg
@@ -409,18 +466,17 @@ class BitgetBot:
 
             return Signal(
                 "buy", symbol, entry, stop, target,
-                f"15M UP + 5M breakout above {prev_high:.4f} | Body:{cur_body:.2f}"
+                f"15M UP | ADX:{dbg['adx']} | RSI:{dbg['rsi']} | Pullback+BullCandle | Body:{cur_body:.2f}"
             ), "LONG ✅", dbg
 
         # ── SHORT SETUP ────────────────────────────────────
-        if trend_down and bear_breakout and body_ok and range_ok:
+        if trend_down and pullback_bear and bear_candle and body_ok and rsi_ok_sell and vol_ok:
             entry = float(cur_close)
-            stop  = float(prev_high)
+            stop  = float(cur_high)
 
-            # Minimum SL distance check
             min_sl = entry * MIN_SL_PCT
             if (stop - entry) < min_sl:
-                return None, f"SL too tight ({stop-entry:.5f} < min {min_sl:.5f})", dbg
+                stop = entry + min_sl
 
             if stop <= entry:
                 return None, "Invalid short SL <= entry", dbg
@@ -430,18 +486,36 @@ class BitgetBot:
 
             return Signal(
                 "sell", symbol, entry, stop, target,
-                f"15M DOWN + 5M breakout below {prev_low:.4f} | Body:{cur_body:.2f}"
+                f"15M DOWN | ADX:{dbg['adx']} | RSI:{dbg['rsi']} | Pullback+BearCandle | Body:{cur_body:.2f}"
             ), "SHORT ✅", dbg
 
         # ── NO SIGNAL — detailed reason ────────────────────
-        if trend_up and not bull_breakout:
-            reason = f"Waiting 5M breakout above {prev_high:.4f} (cur:{cur_close:.4f})"
-        elif trend_down and not bear_breakout:
-            reason = f"Waiting 5M breakout below {prev_low:.4f} (cur:{cur_close:.4f})"
-        elif not body_ok:
-            reason = f"Weak breakout candle body {cur_body:.2f} < {BREAKOUT_BODY_MIN}"
-        elif not range_ok:
-            reason = f"Candle too small — range {cur_range:.5f} < avg {avg_range:.5f}"
+        if trend_up:
+            if not pullback_bull:
+                reason = f"Waiting pullback to 5M EMA50 ({ema50_5m:.4f}) — cur low:{prev_low:.4f}"
+            elif not bull_candle:
+                reason = "Pullback zone hit but no bullish candle yet"
+            elif not body_ok:
+                reason = f"Weak candle body {cur_body:.2f} < {CANDLE_BODY_RATIO_MIN}"
+            elif not rsi_ok_buy:
+                reason = f"RSI {dbg['rsi']} <= 50 — no buy momentum"
+            elif not vol_ok:
+                reason = f"Low volume — cur:{cur_vol:.0f} avg:{avg_vol:.0f}"
+            else:
+                reason = "Waiting for setup"
+        elif trend_down:
+            if not pullback_bear:
+                reason = f"Waiting pullback to 5M EMA50 ({ema50_5m:.4f}) — cur high:{prev_high:.4f}"
+            elif not bear_candle:
+                reason = "Pullback zone hit but no bearish candle yet"
+            elif not body_ok:
+                reason = f"Weak candle body {cur_body:.2f} < {CANDLE_BODY_RATIO_MIN}"
+            elif not rsi_ok_sell:
+                reason = f"RSI {dbg['rsi']} >= 50 — no sell momentum"
+            elif not vol_ok:
+                reason = f"Low volume — cur:{cur_vol:.0f} avg:{avg_vol:.0f}"
+            else:
+                reason = "Waiting for setup"
         else:
             reason = "No valid setup"
 
@@ -691,26 +765,29 @@ def keyboard():
 def fmt_debug(sym, d):
     if not d:
         return f"📍 {sym.replace('/USDT:USDT','')} ⏳ No data yet\n"
-    age      = int(time.time() - d.get("time", time.time()))
-    signal   = d.get("signal") or "—"
-    why      = d.get("why", "—")
-    trend    = d.get("trend", "—")
-    ema200   = d.get("ema200_15", "—")
-    slope    = d.get("ema_slope", 0)
-    dist_pct = d.get("ema_dist_pct", "—")
-    dist_ok  = "✅" if d.get("dist_ok") else "❌"
-    candle_ok= "✅" if d.get("candle_ok") else "❌"
-    bull_b   = "✅" if d.get("bull_break") else "⏳"
-    bear_b   = "✅" if d.get("bear_break") else "⏳"
-    body_ok  = "✅" if d.get("body_ok") else "❌"
-    range_ok = "✅" if d.get("range_ok") else "❌"
-    sym_c    = sym.replace("/USDT:USDT", "")
+    age          = int(time.time() - d.get("time", time.time()))
+    signal       = d.get("signal") or "—"
+    why          = d.get("why", "—")
+    trend        = d.get("trend", "—")
+    ema50_15     = d.get("ema50_15", "—")
+    ema50_5m     = d.get("ema50_5m", "—")
+    slope        = d.get("ema_slope", 0)
+    adx          = d.get("adx", "—")
+    adx_ok       = "✅" if d.get("adx_ok") else "❌"
+    rsi          = d.get("rsi", "—")
+    rsi_buy      = "✅" if d.get("rsi_ok_buy") else "—"
+    rsi_sell     = "✅" if d.get("rsi_ok_sell") else "—"
+    vol_ok       = "✅" if d.get("vol_ok") else "❌"
+    body_ok      = "✅" if d.get("body_ok") else "❌"
+    pb_bull      = "✅" if d.get("pullback_bull") else "⏳"
+    pb_bear      = "✅" if d.get("pullback_bear") else "⏳"
+    sym_c        = sym.replace("/USDT:USDT", "")
     return (
         f"📍 {sym_c} ({age}s)\n"
-        f"15M: {trend} | EMA200:{ema200} Slope:{slope:.5f}\n"
-        f"Dist: {dist_pct}% {dist_ok} | 15M Candle:{candle_ok}\n"
-        f"5M:  Break Bull:{bull_b} Bear:{bear_b}\n"
-        f"5M:  Body:{body_ok} | Range:{range_ok}\n"
+        f"15M: {trend} | EMA50:{ema50_15} Slope:{slope:.5f}\n"
+        f"ADX: {adx} {adx_ok} | RSI: {rsi} Buy:{rsi_buy} Sell:{rsi_sell}\n"
+        f"5M:  EMA50:{ema50_5m} | Pullback Bull:{pb_bull} Bear:{pb_bear}\n"
+        f"Body:{body_ok} | Vol:{vol_ok}\n"
         f"Signal: {signal} | {why}\n"
     )
 
@@ -749,8 +826,9 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(bot.scan_symbol(sym, stagger=i * 12))
         await safe_edit(q,
             f"🔍 Scanner active\n"
-            f"Pairs: SOL DOGE XRP\n"
-            f"Strategy: 15M EMA200 + 5M Breakout\n"
+            f"Pairs: SOL XRP ADA\n"
+            f"Strategy: 15M EMA50 Trend + 5M Pullback\n"
+            f"Filters: ADX>{ADX_MIN} | RSI50 | Volume | Body>=50%\n"
             f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
             f"RR: 1:{RR_RATIO} | Leverage: {LEVERAGE}x\n"
             f"Risk/trade: ${RISK_PER_TRADE:.2f} fixed",
@@ -816,8 +894,9 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot._chat_ids.add(update.message.chat_id)
     await update.message.reply_text(
         "💎 Bitget Crypto Futures Bot\n"
-        "Strategy: 15M EMA200 Trend + 5M Breakout\n"
-        "Pairs: SOL DOGE XRP perpetuals\n"
+        "Strategy: 15M EMA50 Trend + 5M Pullback\n"
+        f"Filters: ADX>{ADX_MIN} | RSI50 | Volume | Body>=50%\n"
+        "Pairs: SOL XRP ADA perpetuals\n"
         f"RR: 1:{RR_RATIO} | Leverage: {LEVERAGE}x\n"
         f"Risk/trade: ${RISK_PER_TRADE:.2f} fixed\n"
         f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
@@ -838,13 +917,13 @@ async def symbols_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         markets = bot.exchange.markets
         sol  = [s for s in markets.keys() if "SOL"  in s and "USDT" in s]
-        doge = [s for s in markets.keys() if "DOGE" in s and "USDT" in s]
         xrp  = [s for s in markets.keys() if "XRP"  in s and "USDT" in s]
+        ada  = [s for s in markets.keys() if "ADA"  in s and "USDT" in s]
         msg = (
             f"📋 Available USDT Markets on Bitget\n\n"
             f"SOL pairs:\n" + "\n".join(sol[:10] or ["None found"]) + "\n\n"
-            f"DOGE pairs:\n" + "\n".join(doge[:10] or ["None found"]) + "\n\n"
-            f"XRP pairs:\n" + "\n".join(xrp[:10] or ["None found"])
+            f"XRP pairs:\n" + "\n".join(xrp[:10] or ["None found"]) + "\n\n"
+            f"ADA pairs:\n" + "\n".join(ada[:10] or ["None found"])
         )
         await update.message.reply_text(msg[:4000])
     except Exception as e:

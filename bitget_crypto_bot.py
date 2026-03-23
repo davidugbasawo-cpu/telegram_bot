@@ -3,20 +3,10 @@ Bitget Crypto Futures Bot
 Strategy: Binary Trend Pullback (15M Trend + 5M Pullback Entry)
   15M → trend direction (EMA 50)
   5M  → pullback to EMA 50 + strong candle + ADX + RSI + Volume
-Pairs: BTC/USDT:USDT, ETH/USDT:USDT, SOL/USDT:USDT perpetual futures
 
-Strategy rules:
-- 15M EMA 50: price above = BUY only | price below = SELL only
-- ADX (14) > 25: trend must be strong, skip if choppy
-- RSI (14): BUY requires RSI > 50 | SELL requires RSI < 50
-- 5M pullback: price retraces toward EMA 50 then strong candle fires
-- Candle body >= 50% of range (no doji)
-- Volume: entry candle must be above average volume
-- Session filter: London + New York sessions only (UTC)
-- RR: 1:4
-- Fixed risk: $0.25 per trade
-- Daily trade limit: 6
-- Consecutive loss pause: 3 losses = 2 hour pause
+Mode:
+- PAPER_MODE = True  -> simulate trades only
+- PAPER_MODE = False -> place real live Bitget orders
 """
 
 import asyncio
@@ -42,7 +32,8 @@ BITGET_SECRET     = "e2bf8eed9bc0f4963d4c2c325ba19eb03476f9b504341217bbbe7343c80
 BITGET_PASSPHRASE = "Salome1234"
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "8697638086:AAG00D0RXUAqXFTjy8-4XO4Bka2kBamo-VA")
 
-USE_TESTNET = False  # Live mode only
+USE_TESTNET = False
+PAPER_MODE  = True   # True = simulate trades | False = real orders
 
 # ========================= MARKETS =========================
 SYMBOLS = ["SOL/USDT:USDT", "XRP/USDT:USDT", "ADA/USDT:USDT"]
@@ -54,34 +45,32 @@ CANDLES_15M = 150
 CANDLES_5M  = 80
 
 # ========================= INDICATORS =========================
-EMA_PERIOD    = 50    # EMA 50 for trend direction
-ADX_PERIOD    = 14    # ADX period
-ADX_MIN       = 25    # ADX must be > 25 (strong trend)
-RSI_PERIOD    = 14    # RSI period
-VOLUME_LOOKBACK = 20  # Candles to calculate average volume
+EMA_PERIOD      = 50
+ADX_PERIOD      = 14
+ADX_MIN         = 25
+RSI_PERIOD      = 14
+VOLUME_LOOKBACK = 20
 
 # ========================= PULLBACK FILTER =========================
-PULLBACK_ZONE_PCT     = 0.003   # Price must come within 0.3% of EMA50 on 5M
-CANDLE_BODY_RATIO_MIN = 0.50    # Entry candle body >= 50% of range
-SLOPE_LOOKBACK        = 5       # Candles to measure EMA50 slope
+PULLBACK_ZONE_PCT     = 0.003
+CANDLE_BODY_RATIO_MIN = 0.50
+SLOPE_LOOKBACK        = 5
 
 # ========================= SESSION FILTER =========================
-# London session: 08:00-16:00 UTC
-# New York session: 13:00-21:00 UTC
-SESSION_START_UTC = 8    # 08:00 UTC
-SESSION_END_UTC   = 21   # 21:00 UTC
+SESSION_START_UTC = 8
+SESSION_END_UTC   = 21
 
 # ========================= RISK =========================
-RISK_PER_TRADE = 0.25   # Fixed $0.25 per trade
+RISK_PER_TRADE = 0.25
 LEVERAGE       = 3
-RR_RATIO       = 4.0    # 1:4 risk/reward
-MIN_SL_PCT     = 0.0015 # Minimum SL distance = 0.15% of entry
+RR_RATIO       = 4.0
+MIN_SL_PCT     = 0.0015
 
 # ========================= LIMITS =========================
 MAX_TRADES_PER_DAY   = 6
 MAX_CONSEC_LOSSES    = 3
-CONSEC_LOSS_PAUSE_HR = 2      # Pause 2 hours after 3 consecutive losses
-COOLDOWN_SEC         = 300    # 5 min between trades
+CONSEC_LOSS_PAUSE_HR = 2
+COOLDOWN_SEC         = 300
 MAX_OPEN_POSITIONS   = 1
 
 # ========================= OTHER =========================
@@ -103,29 +92,14 @@ def ema_value(closes, period):
     return float(ema)
 
 
-def ema_series(closes, period):
-    closes = np.array(closes, dtype=float)
-    if len(closes) < period:
-        return []
-    k = 2.0 / (period + 1)
-    ema = float(np.mean(closes[:period]))
-    out = [None] * (period - 1) + [ema]
-    for c in closes[period:]:
-        ema = c * k + ema * (1 - k)
-        out.append(float(ema))
-    return out
-
-
 def candle_body_ratio(candle):
-    """Body as ratio of total candle range"""
-    rng = abs(candle[2] - candle[3])  # high - low
+    rng = abs(candle[2] - candle[3])
     if rng == 0:
         return 0.0
-    return abs(candle[4] - candle[1]) / rng  # |close - open| / range
+    return abs(candle[4] - candle[1]) / rng
 
 
 def rsi_value(closes, period=14):
-    """Calculate RSI from closes list"""
     closes = np.array(closes, dtype=float)
     if len(closes) < period + 1:
         return None
@@ -144,7 +118,6 @@ def rsi_value(closes, period=14):
 
 
 def adx_value(candles, period=14):
-    """Calculate ADX from candles list [[ts,o,h,l,c,v],...]"""
     if len(candles) < period * 2 + 1:
         return None
     highs  = np.array([c[2] for c in candles], dtype=float)
@@ -169,7 +142,7 @@ def adx_value(candles, period=14):
             out.append(s)
         return out
 
-    atr  = smooth(tr_list,  period)
+    atr  = smooth(tr_list, period)
     apdm = smooth(pdm_list, period)
     andm = smooth(ndm_list, period)
 
@@ -183,12 +156,10 @@ def adx_value(candles, period=14):
 
     if len(dx_list) < period:
         return None
-    adx = float(np.mean(dx_list[-period:]))
-    return adx
+    return float(np.mean(dx_list[-period:]))
 
 
 def is_session_active():
-    """Check if current UTC hour is within active trading session"""
     utc_hour = datetime.utcnow().hour
     return SESSION_START_UTC <= utc_hour < SESSION_END_UTC
 
@@ -214,7 +185,8 @@ class BitgetBot:
         self.exchange          = None
         self.app               = None
         self.is_scanning       = False
-        self.active_positions  = {}
+        self.active_positions  = {}   # real positions
+        self.paper_positions   = {}   # paper positions
         self.cooldown_until    = 0
         self.pause_until       = 0
         self.status_cd_until   = 0
@@ -261,16 +233,30 @@ class BitgetBot:
                     await self.exchange.close()
                 except Exception:
                     pass
+
             self.exchange = ccxt.bitget({
-                "apiKey":   BITGET_API_KEY,
-                "secret":   BITGET_SECRET,
+                "apiKey": BITGET_API_KEY,
+                "secret": BITGET_SECRET,
                 "password": BITGET_PASSPHRASE,
                 "enableRateLimit": True,
-                "options":  {"defaultType": "swap"},
+                "options": {
+                    "defaultType": "swap",
+                },
             })
+
+            if USE_TESTNET:
+                self.exchange.set_sandbox_mode(True)
+
             await self.exchange.load_markets()
             await self.fetch_balance()
-            logger.info(f"Connected to Bitget LIVE")
+
+            for sym in SYMBOLS:
+                if sym in self.exchange.markets:
+                    logger.info(f"MARKET OK: {sym}")
+                else:
+                    logger.warning(f"MARKET MISSING: {sym}")
+
+            logger.info(f"Connected to Bitget {'TESTNET' if USE_TESTNET else 'LIVE'} | PAPER_MODE={PAPER_MODE}")
             return True
         except Exception as e:
             logger.error(f"Connect failed: {e}")
@@ -295,10 +281,12 @@ class BitgetBot:
             except Exception:
                 pass
 
+    def total_open_positions(self):
+        return len(self.active_positions) + len(self.paper_positions)
+
     def can_trade(self):
         self._reset_daily()
 
-        # Session filter
         if not is_session_active():
             utc_hour = datetime.utcnow().hour
             return False, f"Outside session ({utc_hour:02d}:00 UTC) — active {SESSION_START_UTC:02d}:00-{SESSION_END_UTC:02d}:00"
@@ -311,7 +299,7 @@ class BitgetBot:
             left = int(self.cooldown_until - time.time())
             return False, f"Cooldown {left}s"
 
-        if len(self.active_positions) >= MAX_OPEN_POSITIONS:
+        if self.total_open_positions() >= MAX_OPEN_POSITIONS:
             return False, "Max positions open"
 
         if self.trades_today >= MAX_TRADES_PER_DAY:
@@ -331,12 +319,10 @@ class BitgetBot:
                     logger.warning(f"OHLCV {symbol} {tf}: Empty response (attempt {attempt}/{max_retries})")
                     await asyncio.sleep(2 * attempt)
                     continue
-                # Drop last (open/unconfirmed) candle
                 return data[:-1] if len(data) > 1 else data
             except Exception as e:
                 err = str(e)
                 logger.warning(f"OHLCV {symbol} {tf} attempt {attempt}/{max_retries}: {err}")
-                # Rate limit — wait longer
                 if "rate limit" in err.lower() or "429" in err:
                     await asyncio.sleep(5 * attempt)
                 elif attempt < max_retries:
@@ -345,33 +331,18 @@ class BitgetBot:
         return []
 
     def build_signal(self, symbol, c15, c5):
-        """
-        Returns (Signal | None, reason_str, debug_dict)
-
-        Logic:
-        1. 15M EMA 50 direction → trend (UP/DOWN)
-        2. 15M ADX > 25 → trend is strong enough
-        3. 5M: price pulled back to within 0.3% of EMA 50
-        4. 5M: strong candle fires in trend direction (body >= 50%)
-        5. 5M: RSI > 50 for BUY | RSI < 50 for SELL
-        6. 5M: entry candle volume > average volume
-        7. SL: below/above entry candle low/high
-        8. TP: entry + risk * 4 (1:4 RR)
-        """
         dbg = {}
 
-        # ── 15M TREND ──────────────────────────────────────
         if len(c15) < EMA_PERIOD + SLOPE_LOOKBACK + 5:
             return None, "15M warming up", dbg
 
-        cl15   = [x[4] for x in c15]
+        cl15    = [x[4] for x in c15]
         price15 = cl15[-1]
 
         ema50_15 = ema_value(cl15, EMA_PERIOD)
         if ema50_15 is None:
             return None, "EMA50 not ready", dbg
 
-        # Slope check
         ema50_old = ema_value(cl15[:-SLOPE_LOOKBACK], EMA_PERIOD)
         ema_slope = (ema50_15 - ema50_old) if ema50_old else 0.0
 
@@ -380,13 +351,12 @@ class BitgetBot:
 
         dbg["ema50_15"] = round(ema50_15, 5)
         dbg["price15"]  = round(price15, 5)
-        dbg["ema_slope"]= round(ema_slope, 6)
+        dbg["ema_slope"] = round(ema_slope, 6)
         dbg["trend"]    = "UP" if trend_up else "DOWN" if trend_down else "SIDE"
 
         if not trend_up and not trend_down:
             return None, f"15M sideways | Price:{price15:.4f} EMA50:{ema50_15:.4f}", dbg
 
-        # ── ADX FILTER (15M) ───────────────────────────────
         adx = adx_value(c15, ADX_PERIOD)
         adx_ok = adx is not None and adx > ADX_MIN
         dbg["adx"]    = round(adx, 2) if adx else "N/A"
@@ -395,7 +365,6 @@ class BitgetBot:
         if not adx_ok:
             return None, f"ADX too low ({dbg['adx']} <= {ADX_MIN}) — market choppy", dbg
 
-        # ── 5M ENTRY ───────────────────────────────────────
         if len(c5) < RSI_PERIOD + VOLUME_LOOKBACK + 5:
             return None, "5M warming up", dbg
 
@@ -410,29 +379,23 @@ class BitgetBot:
         cur_close = cur5[4]
         cur_vol   = cur5[5]
 
-        # EMA 50 on 5M for pullback zone
         ema50_5m = ema_value(cl5, EMA_PERIOD)
         if ema50_5m is None:
             return None, "5M EMA50 not ready", dbg
 
-        # RSI on 5M
         rsi = rsi_value(cl5, RSI_PERIOD)
         rsi_ok_buy  = rsi is not None and rsi > 50
         rsi_ok_sell = rsi is not None and rsi < 50
 
-        # Volume filter — current candle volume > average of last N candles
-        avg_vol  = float(np.mean(vol5[-(VOLUME_LOOKBACK + 1):-1])) if len(vol5) > VOLUME_LOOKBACK else 0
-        vol_ok   = avg_vol == 0 or cur_vol > avg_vol
+        avg_vol = float(np.mean(vol5[-(VOLUME_LOOKBACK + 1):-1])) if len(vol5) > VOLUME_LOOKBACK else 0
+        vol_ok  = avg_vol == 0 or cur_vol > avg_vol
 
-        # Candle body
         cur_body = candle_body_ratio(cur5)
         body_ok  = cur_body >= CANDLE_BODY_RATIO_MIN
 
-        # Candle direction
         bull_candle = cur_close > cur_open
         bear_candle = cur_close < cur_open
 
-        # Pullback check — previous candle came within 0.3% of 5M EMA50
         prev_low  = prev5[3]
         prev_high = prev5[2]
         pullback_bull = abs(prev_low  - ema50_5m) / ema50_5m <= PULLBACK_ZONE_PCT
@@ -449,7 +412,6 @@ class BitgetBot:
         dbg["pullback_bull"] = pullback_bull
         dbg["pullback_bear"] = pullback_bear
 
-        # ── LONG SETUP ─────────────────────────────────────
         if trend_up and pullback_bull and bull_candle and body_ok and rsi_ok_buy and vol_ok:
             entry = float(cur_close)
             stop  = float(cur_low)
@@ -469,7 +431,6 @@ class BitgetBot:
                 f"15M UP | ADX:{dbg['adx']} | RSI:{dbg['rsi']} | Pullback+BullCandle | Body:{cur_body:.2f}"
             ), "LONG ✅", dbg
 
-        # ── SHORT SETUP ────────────────────────────────────
         if trend_down and pullback_bear and bear_candle and body_ok and rsi_ok_sell and vol_ok:
             entry = float(cur_close)
             stop  = float(cur_high)
@@ -489,7 +450,6 @@ class BitgetBot:
                 f"15M DOWN | ADX:{dbg['adx']} | RSI:{dbg['rsi']} | Pullback+BearCandle | Body:{cur_body:.2f}"
             ), "SHORT ✅", dbg
 
-        # ── NO SIGNAL — detailed reason ────────────────────
         if trend_up:
             if not pullback_bull:
                 reason = f"Waiting pullback to 5M EMA50 ({ema50_5m:.4f}) — cur low:{prev_low:.4f}"
@@ -524,30 +484,61 @@ class BitgetBot:
     async def set_leverage(self, symbol):
         try:
             await self.exchange.set_leverage(
-                LEVERAGE, symbol,
-                params={"marginMode": "crossed"}
+                LEVERAGE,
+                symbol,
+                params={
+                    "marginMode": "cross",
+                }
             )
         except Exception as e:
             logger.warning(f"Leverage set failed {symbol}: {e}")
 
     async def get_size(self, symbol, entry, stop):
-        """Calculate position size based on fixed $0.25 risk"""
         await self.fetch_balance()
-        risk_amount   = RISK_PER_TRADE   # Fixed $0.25
+        risk_amount   = RISK_PER_TRADE
         stop_distance = abs(entry - stop)
         if stop_distance <= 0:
             return 0.0
-        market        = self.exchange.market(symbol)
+
+        market = self.exchange.market(symbol)
         contract_size = float(market.get("contractSize", 1.0) or 1.0)
-        raw_size      = risk_amount / (stop_distance * contract_size)
-        precision     = market.get("precision", {}).get("amount")
-        size          = float(self.exchange.amount_to_precision(symbol, raw_size)) if precision else raw_size
-        min_amt       = float((market.get("limits", {}).get("amount") or {}).get("min") or 0)
+        raw_size = risk_amount / (stop_distance * contract_size)
+
+        precision = market.get("precision", {}).get("amount")
+        size = float(self.exchange.amount_to_precision(symbol, raw_size)) if precision is not None else raw_size
+
+        min_amt = float((market.get("limits", {}).get("amount") or {}).get("min") or 0)
         if min_amt and size < min_amt:
             size = min_amt
+
         return float(size)
 
-    async def place_trade(self, signal: Signal):
+    async def place_paper_trade(self, signal: Signal):
+        sym_clean = signal.symbol.replace("/USDT:USDT", "")
+        self.paper_positions[signal.symbol] = {
+            "side": signal.side,
+            "entry": signal.entry,
+            "stop": signal.stop,
+            "target": signal.target,
+            "opened_at": time.time(),
+            "size": 0.0,
+            "reason": signal.reason,
+        }
+        self.trades_today += 1
+        self.cooldown_until = time.time() + COOLDOWN_SEC
+
+        await self.tg(
+            f"📝 PAPER TRADE OPENED {sym_clean} {signal.side.upper()}\n"
+            f"Entry:  {signal.entry:.5f}\n"
+            f"Stop:   {signal.stop:.5f}\n"
+            f"Target: {signal.target:.5f}\n"
+            f"Virtual Risk: ${RISK_PER_TRADE:.2f}\n"
+            f"RR: 1:{RR_RATIO}\n"
+            f"Reason: {signal.reason}"
+        )
+        logger.info(f"PAPER trade opened: {signal.symbol} {signal.side} @ {signal.entry}")
+
+    async def place_live_trade(self, signal: Signal):
         await self.set_leverage(signal.symbol)
         size = await self.get_size(signal.symbol, signal.entry, signal.stop)
         if size <= 0:
@@ -555,87 +546,196 @@ class BitgetBot:
             return
 
         opposite = "sell" if signal.side == "buy" else "buy"
+        hold_side = "long" if signal.side == "buy" else "short"
+
+        entry_params = {
+            "marginMode": "cross",
+            "tradeSide": "open",
+            "holdSide": hold_side,
+        }
+
+        sl_params = {
+            "stopPrice": signal.stop,
+            "triggerPrice": signal.stop,
+            "reduceOnly": True,
+            "marginMode": "cross",
+            "tradeSide": "close",
+            "holdSide": hold_side,
+        }
+
+        tp_params = {
+            "stopPrice": signal.target,
+            "triggerPrice": signal.target,
+            "reduceOnly": True,
+            "marginMode": "cross",
+            "tradeSide": "close",
+            "holdSide": hold_side,
+        }
 
         try:
-            # ── ENTRY ──────────────────────────────────────────
+            logger.info(
+                f"Placing {signal.side.upper()} on {signal.symbol} | "
+                f"entry={signal.entry} stop={signal.stop} target={signal.target} size={size}"
+            )
+
             entry_order = await self.exchange.create_order(
                 symbol=signal.symbol,
                 type="market",
                 side=signal.side,
                 amount=size,
-                params={"marginMode": "crossed"}
+                params=entry_params,
             )
+
             avg_price = float(entry_order.get("average") or entry_order.get("price") or signal.entry)
 
             await asyncio.sleep(0.5)
 
-            # ── STOP LOSS ──────────────────────────────────────
             try:
                 await self.exchange.create_order(
                     symbol=signal.symbol,
                     type="stop_market",
                     side=opposite,
                     amount=size,
-                    params={
-                        "stopPrice":  signal.stop,
-                        "reduceOnly": True,
-                        "marginMode": "crossed",
-                    }
+                    params=sl_params,
                 )
             except Exception as sl_err:
-                logger.warning(f"SL order failed {signal.symbol}: {sl_err} — trade open without SL")
-                await self.tg(f"⚠️ SL order failed for {signal.symbol.replace('/USDT:USDT','')} — close manually if needed")
+                logger.warning(f"SL order failed {signal.symbol}: {sl_err}")
+                await self.tg(
+                    f"⚠️ SL order failed for {signal.symbol.replace('/USDT:USDT','')} — close manually if needed"
+                )
 
             await asyncio.sleep(0.5)
 
-            # ── TAKE PROFIT ────────────────────────────────────
             try:
                 await self.exchange.create_order(
                     symbol=signal.symbol,
                     type="take_profit_market",
                     side=opposite,
                     amount=size,
-                    params={
-                        "stopPrice":  signal.target,
-                        "reduceOnly": True,
-                        "marginMode": "crossed",
-                    }
+                    params=tp_params,
                 )
             except Exception as tp_err:
-                logger.warning(f"TP order failed {signal.symbol}: {tp_err} — trade open without TP")
-                await self.tg(f"⚠️ TP order failed for {signal.symbol.replace('/USDT:USDT','')} — close manually if needed")
+                logger.warning(f"TP order failed {signal.symbol}: {tp_err}")
+                await self.tg(
+                    f"⚠️ TP order failed for {signal.symbol.replace('/USDT:USDT','')} — close manually if needed"
+                )
 
             self.active_positions[signal.symbol] = {
-                "side":      signal.side,
-                "size":      size,
-                "entry":     avg_price,
-                "stop":      signal.stop,
-                "target":    signal.target,
+                "side": signal.side,
+                "size": size,
+                "entry": avg_price,
+                "stop": signal.stop,
+                "target": signal.target,
                 "opened_at": time.time(),
             }
-            self.trades_today   += 1
-            self.cooldown_until  = time.time() + COOLDOWN_SEC
+            self.trades_today += 1
+            self.cooldown_until = time.time() + COOLDOWN_SEC
 
-            sym_clean   = signal.symbol.replace("/USDT:USDT", "")
+            sym_clean = signal.symbol.replace("/USDT:USDT", "")
             risk_actual = abs(avg_price - signal.stop) * size
+
             await self.tg(
-                f"🚀 {sym_clean} {signal.side.upper()}\n"
+                f"🚀 LIVE TRADE OPENED {sym_clean} {signal.side.upper()}\n"
                 f"Entry:  {avg_price:.5f}\n"
                 f"Stop:   {signal.stop:.5f}\n"
                 f"Target: {signal.target:.5f}\n"
                 f"Size:   {size} contracts\n"
                 f"Risk:   ${risk_actual:.3f}\n"
-                f"RR:     1:{RR_RATIO}\n"
+                f"RR: 1:{RR_RATIO}\n"
                 f"Reason: {signal.reason}"
             )
-            logger.info(f"Trade opened: {signal.symbol} {signal.side} @ {avg_price}")
+            logger.info(f"LIVE trade opened: {signal.symbol} {signal.side} @ {avg_price}")
 
         except Exception as e:
             logger.error(f"Order failed {signal.symbol}: {e}")
-            await self.tg(f"❌ Order failed {signal.symbol}: {str(e)[:200]}")
+            await self.tg(f"❌ Order failed {signal.symbol}: {str(e)[:250]}")
 
-    async def reconcile(self):
-        """Check if positions closed and update PnL"""
+    async def place_trade(self, signal: Signal):
+        if PAPER_MODE:
+            await self.place_paper_trade(signal)
+        else:
+            await self.place_live_trade(signal)
+
+    async def reconcile_paper_positions(self):
+        if not self.exchange or not self.paper_positions:
+            return
+
+        for sym in list(self.paper_positions.keys()):
+            try:
+                pos = self.paper_positions[sym]
+                candles = await self.fetch_ohlcv(sym, TF_ENTRY, 3)
+                if not candles:
+                    continue
+
+                last = candles[-1]
+                high = float(last[2])
+                low  = float(last[3])
+
+                side   = pos["side"]
+                entry  = float(pos["entry"])
+                stop   = float(pos["stop"])
+                target = float(pos["target"])
+
+                result = None
+                pnl = 0.0
+
+                if side == "buy":
+                    if low <= stop:
+                        result = "LOSS"
+                        pnl = -RISK_PER_TRADE
+                    elif high >= target:
+                        result = "WIN"
+                        pnl = RISK_PER_TRADE * RR_RATIO
+                else:
+                    if high >= stop:
+                        result = "LOSS"
+                        pnl = -RISK_PER_TRADE
+                    elif low <= target:
+                        result = "WIN"
+                        pnl = RISK_PER_TRADE * RR_RATIO
+
+                if result is None:
+                    continue
+
+                self.paper_positions.pop(sym, None)
+
+                if pnl < 0:
+                    self.consec_losses += 1
+                    self.losses_today += 1
+                    if self.consec_losses >= MAX_CONSEC_LOSSES:
+                        self.pause_until = time.time() + (CONSEC_LOSS_PAUSE_HR * 3600)
+                        await self.tg(
+                            f"⏸ {MAX_CONSEC_LOSSES} consecutive losses — pausing {CONSEC_LOSS_PAUSE_HR}h to protect balance"
+                        )
+                else:
+                    self.consec_losses = 0
+
+                self.profit_today = round(self.profit_today + pnl, 4)
+
+                self._save_trade({
+                    "time": time.time(),
+                    "symbol": sym,
+                    "side": side,
+                    "entry": entry,
+                    "stop": stop,
+                    "target": target,
+                    "pnl": pnl,
+                    "mode": "paper",
+                    "result": result,
+                })
+
+                sym_clean = sym.replace("/USDT:USDT", "")
+                await self.tg(
+                    f"{'✅ PAPER WIN' if pnl >= 0 else '❌ PAPER LOSS'} {sym_clean}\n"
+                    f"PnL: {pnl:+.4f} USDT\n"
+                    f"Today: {self.profit_today:+.4f} USDT | "
+                    f"Streak: {self.consec_losses}/{MAX_CONSEC_LOSSES}"
+                )
+
+            except Exception as e:
+                logger.warning(f"Paper reconcile error {sym}: {e}")
+
+    async def reconcile_live_positions(self):
         if not self.exchange or not self.active_positions:
             return
         try:
@@ -656,12 +756,10 @@ class BitgetBot:
                     if pnl < 0:
                         self.consec_losses += 1
                         self.losses_today  += 1
-                        # Trigger pause if consecutive losses hit limit
                         if self.consec_losses >= MAX_CONSEC_LOSSES:
                             self.pause_until = time.time() + (CONSEC_LOSS_PAUSE_HR * 3600)
                             await self.tg(
-                                f"⏸ {MAX_CONSEC_LOSSES} consecutive losses — "
-                                f"pausing {CONSEC_LOSS_PAUSE_HR}h to protect balance"
+                                f"⏸ {MAX_CONSEC_LOSSES} consecutive losses — pausing {CONSEC_LOSS_PAUSE_HR}h to protect balance"
                             )
                     else:
                         self.consec_losses = 0
@@ -669,25 +767,32 @@ class BitgetBot:
                     self.profit_today = round(self.profit_today + pnl, 4)
 
                     self._save_trade({
-                        "time":   time.time(),
+                        "time": time.time(),
                         "symbol": sym,
-                        "side":   pos["side"],
-                        "entry":  pos["entry"],
-                        "stop":   pos["stop"],
+                        "side": pos["side"],
+                        "entry": pos["entry"],
+                        "stop": pos["stop"],
                         "target": pos["target"],
-                        "pnl":    pnl,
+                        "pnl": pnl,
+                        "mode": "live",
                     })
 
                     sym_clean = sym.replace("/USDT:USDT", "")
                     await self.tg(
-                        f"{'✅ WIN' if pnl >= 0 else '❌ LOSS'} {sym_clean}\n"
+                        f"{'✅ LIVE WIN' if pnl >= 0 else '❌ LIVE LOSS'} {sym_clean}\n"
                         f"PnL: {pnl:+.4f} USDT\n"
                         f"Today: {self.profit_today:+.4f} USDT | "
                         f"Streak: {self.consec_losses}/{MAX_CONSEC_LOSSES}"
                     )
 
         except Exception as e:
-            logger.warning(f"Reconcile error: {e}")
+            logger.warning(f"Live reconcile error: {e}")
+
+    async def reconcile(self):
+        if PAPER_MODE:
+            await self.reconcile_paper_positions()
+        else:
+            await self.reconcile_live_positions()
 
     async def scan_symbol(self, symbol, stagger=0):
         await asyncio.sleep(stagger)
@@ -699,40 +804,33 @@ class BitgetBot:
                 self._reset_daily()
 
                 if not self.exchange:
-                    self.market_debug[symbol] = {
-                        "time": time.time(), "why": "Not connected", "signal": None}
+                    self.market_debug[symbol] = {"time": time.time(), "why": "Not connected", "signal": None}
                     await asyncio.sleep(5)
                     continue
 
-                if symbol in self.active_positions:
+                if symbol in self.active_positions or symbol in self.paper_positions:
                     continue
 
                 can, gate = self.can_trade()
                 if not can:
-                    self.market_debug[symbol] = {
-                        "time": time.time(), "why": gate, "signal": None}
+                    self.market_debug[symbol] = {"time": time.time(), "why": gate, "signal": None}
                     continue
 
-                self.market_debug[symbol] = {
-                    "time": time.time(), "why": "Fetching candles...", "signal": None}
+                self.market_debug[symbol] = {"time": time.time(), "why": "Fetching candles...", "signal": None}
 
-                # Sequential fetch to avoid rate limits
                 c15 = await self.fetch_ohlcv(symbol, TF_TREND, CANDLES_15M)
                 await asyncio.sleep(0.3)
-                c5  = await self.fetch_ohlcv(symbol, TF_ENTRY,  CANDLES_5M)
+                c5  = await self.fetch_ohlcv(symbol, TF_ENTRY, CANDLES_5M)
 
                 if not c15 or not c5:
                     fail_reason = []
                     if not c15:
-                        fail_reason.append(f"15M: 0 candles")
+                        fail_reason.append("15M: 0 candles")
                     if not c5:
-                        fail_reason.append(f"5M: 0 candles")
+                        fail_reason.append("5M: 0 candles")
                     msg = " | ".join(fail_reason) + " — possible rate limit. Retrying..."
                     logger.warning(f"{symbol}: {msg}")
-                    self.market_debug[symbol] = {
-                        "time": time.time(),
-                        "why": msg,
-                        "signal": None}
+                    self.market_debug[symbol] = {"time": time.time(), "why": msg, "signal": None}
                     await asyncio.sleep(10)
                     continue
 
@@ -747,13 +845,12 @@ class BitgetBot:
 
             except Exception as e:
                 logger.error(f"Scan error {symbol}: {e}")
-                self.market_debug[symbol] = {
-                    "time": time.time(), "why": f"Error: {str(e)[:100]}", "signal": None}
+                self.market_debug[symbol] = {"time": time.time(), "why": f"Error: {str(e)[:100]}", "signal": None}
                 await asyncio.sleep(10)
 
     async def watchdog(self):
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
             try:
                 await self.reconcile()
                 await self.fetch_balance()
@@ -772,13 +869,13 @@ bot = BitgetBot()
 
 def keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ START",   callback_data="START"),
-         InlineKeyboardButton("⏹️ STOP",    callback_data="STOP")],
-        [InlineKeyboardButton("📊 STATUS",  callback_data="STATUS"),
+        [InlineKeyboardButton("▶️ START", callback_data="START"),
+         InlineKeyboardButton("⏹️ STOP", callback_data="STOP")],
+        [InlineKeyboardButton("📊 STATUS", callback_data="STATUS"),
          InlineKeyboardButton("🔄 REFRESH", callback_data="STATUS")],
         [InlineKeyboardButton("🔌 CONNECT", callback_data="CONNECT")],
-        [InlineKeyboardButton("⏸ PAUSE",   callback_data="PAUSE"),
-         InlineKeyboardButton("▶️ RESUME",  callback_data="RESUME")],
+        [InlineKeyboardButton("⏸ PAUSE", callback_data="PAUSE"),
+         InlineKeyboardButton("▶️ RESUME", callback_data="RESUME")],
     ])
 
 
@@ -831,28 +928,35 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "CONNECT":
         ok = await bot.connect()
-        await safe_edit(q,
-            f"{'✅ Connected' if ok else '❌ Failed'} | "
-            f"LIVE | "
-            f"Balance: {bot.balance_usdt:.2f} USDT",
-            keyboard())
+        mode = "PAPER" if PAPER_MODE else "LIVE"
+        await safe_edit(
+            q,
+            f"{'✅ Connected' if ok else '❌ Failed'} | {mode} | Balance: {bot.balance_usdt:.2f} USDT",
+            keyboard()
+        )
 
     elif q.data == "START":
         if not bot.exchange:
             await safe_edit(q, "❌ Connect first", keyboard())
             return
+        bot.is_scanning = False
+        await asyncio.sleep(0.5)
         bot.is_scanning = True
         for i, sym in enumerate(SYMBOLS):
             asyncio.create_task(bot.scan_symbol(sym, stagger=i * 12))
-        await safe_edit(q,
+        mode = "PAPER" if PAPER_MODE else "LIVE"
+        await safe_edit(
+            q,
             f"🔍 Scanner active\n"
+            f"Mode: {mode}\n"
             f"Pairs: SOL XRP ADA\n"
             f"Strategy: 15M EMA50 Trend + 5M Pullback\n"
             f"Filters: ADX>{ADX_MIN} | RSI50 | Volume | Body>=50%\n"
             f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
             f"RR: 1:{RR_RATIO} | Leverage: {LEVERAGE}x\n"
-            f"Risk/trade: ${RISK_PER_TRADE:.2f} fixed",
-            keyboard())
+            f"Risk/trade: ${RISK_PER_TRADE:.2f}",
+            keyboard()
+        )
 
     elif q.data == "STOP":
         bot.is_scanning = False
@@ -863,7 +967,7 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, "⏸ Paused 24h", keyboard())
 
     elif q.data == "RESUME":
-        bot.pause_until   = 0
+        bot.pause_until = 0
         bot.consec_losses = 0
         await safe_edit(q, "▶️ Resumed — consecutive loss counter reset", keyboard())
 
@@ -872,31 +976,35 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if now < bot.status_cd_until:
             await safe_edit(q, f"⏳ {int(bot.status_cd_until-now)}s", keyboard())
             return
+
         bot.status_cd_until = now + STATUS_REFRESH_COOLDOWN
         await bot.fetch_balance()
         _, gate = bot.can_trade()
 
         open_pos = ""
-        for sym, pos in bot.active_positions.items():
+        all_positions = {}
+        all_positions.update(bot.active_positions)
+        all_positions.update(bot.paper_positions)
+
+        for sym, pos in all_positions.items():
             sym_c = sym.replace("/USDT:USDT", "")
             age   = int(time.time() - pos["opened_at"])
             open_pos += (
                 f"\n🔵 {sym_c} {pos['side'].upper()} @ {pos['entry']:.5f} "
-                f"| SL:{pos['stop']:.5f} TP:{pos['target']:.5f} "
-                f"| ({age}s)"
+                f"| SL:{pos['stop']:.5f} TP:{pos['target']:.5f} | ({age}s)"
             )
 
         session_active = is_session_active()
         utc_hour = datetime.utcnow().hour
+        mode = "📝 PAPER" if PAPER_MODE else "💰 LIVE"
 
         header = (
             f"🕒 {now_wat()}\n"
-            f"🤖 {'ACTIVE' if bot.is_scanning else 'OFFLINE'} | 💰 LIVE\n"
+            f"🤖 {'ACTIVE' if bot.is_scanning else 'OFFLINE'} | {mode}\n"
             f"💰 Balance: {bot.balance_usdt:.2f} USDT\n"
             f"📈 PnL Today: {bot.profit_today:+.4f} USDT\n"
             f"🎯 RR 1:{RR_RATIO} | Risk ${RISK_PER_TRADE:.2f} | {LEVERAGE}x\n"
-            f"📉 Streak: {bot.consec_losses}/{MAX_CONSEC_LOSSES} | "
-            f"Trades: {bot.trades_today}/{MAX_TRADES_PER_DAY}\n"
+            f"📉 Streak: {bot.consec_losses}/{MAX_CONSEC_LOSSES} | Trades: {bot.trades_today}/{MAX_TRADES_PER_DAY}\n"
             f"🕐 Session: {'✅ ACTIVE' if session_active else f'❌ CLOSED ({utc_hour:02d}:00 UTC)'}\n"
             f"🚦 Gate: {gate}"
         )
@@ -905,40 +1013,41 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             header += f"\n\n📌 OPEN POSITIONS:{open_pos}"
 
         scan_lines = "\n\n📡 LIVE SCAN\n" + "\n".join(
-            fmt_debug(sym, bot.market_debug.get(sym, {})) for sym in SYMBOLS)
+            fmt_debug(sym, bot.market_debug.get(sym, {})) for sym in SYMBOLS
+        )
 
         await safe_edit(q, header + scan_lines, keyboard())
 
 
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot._chat_ids.add(update.message.chat_id)
+    mode = "PAPER" if PAPER_MODE else "LIVE"
     await update.message.reply_text(
         "💎 Bitget Crypto Futures Bot\n"
+        f"Mode: {mode}\n"
         "Strategy: 15M EMA50 Trend + 5M Pullback\n"
         f"Filters: ADX>{ADX_MIN} | RSI50 | Volume | Body>=50%\n"
         "Pairs: SOL XRP ADA perpetuals\n"
         f"RR: 1:{RR_RATIO} | Leverage: {LEVERAGE}x\n"
-        f"Risk/trade: ${RISK_PER_TRADE:.2f} fixed\n"
+        f"Risk/trade: ${RISK_PER_TRADE:.2f}\n"
         f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
         "1. Press CONNECT\n"
         "2. Press START\n"
-        "3. Press STATUS to monitor\n"
-        "4. Send /symbols to check available pairs",
+        "3. Press STATUS to monitor",
         reply_markup=keyboard()
     )
 
 
 async def symbols_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """List all SOL, DOGE, XRP USDT perpetual markets available on Bitget"""
     bot._chat_ids.add(update.message.chat_id)
     if not bot.exchange:
         await update.message.reply_text("❌ Connect first — press CONNECT button")
         return
     try:
         markets = bot.exchange.markets
-        sol  = [s for s in markets.keys() if "SOL"  in s and "USDT" in s]
-        xrp  = [s for s in markets.keys() if "XRP"  in s and "USDT" in s]
-        ada  = [s for s in markets.keys() if "ADA"  in s and "USDT" in s]
+        sol  = [s for s in markets.keys() if "SOL" in s and "USDT" in s]
+        xrp  = [s for s in markets.keys() if "XRP" in s and "USDT" in s]
+        ada  = [s for s in markets.keys() if "ADA" in s and "USDT" in s]
         msg = (
             f"📋 Available USDT Markets on Bitget\n\n"
             f"SOL pairs:\n" + "\n".join(sol[:10] or ["None found"]) + "\n\n"

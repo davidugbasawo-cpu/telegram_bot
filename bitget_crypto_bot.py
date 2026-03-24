@@ -513,7 +513,10 @@ class BitgetBot:
 
         return float(size)
 
-    async def place_paper_trade(self, signal: Signal):
+    async def place_paper_trade(self, signal: Signal, entry_candle_ts=None):
+        if signal.symbol in self.paper_positions or signal.symbol in self.active_positions:
+            return
+
         sym_clean = signal.symbol.replace("/USDT:USDT", "")
         self.paper_positions[signal.symbol] = {
             "side": signal.side,
@@ -521,9 +524,11 @@ class BitgetBot:
             "stop": signal.stop,
             "target": signal.target,
             "opened_at": time.time(),
+            "opened_candle_ts": entry_candle_ts,
             "size": 0.0,
             "reason": signal.reason,
         }
+
         self.trades_today += 1
         self.cooldown_until = time.time() + COOLDOWN_SEC
 
@@ -650,9 +655,9 @@ class BitgetBot:
             logger.error(f"Order failed {signal.symbol}: {e}")
             await self.tg(f"❌ Order failed {signal.symbol}: {str(e)[:250]}")
 
-    async def place_trade(self, signal: Signal):
+    async def place_trade(self, signal: Signal, entry_candle_ts=None):
         if PAPER_MODE:
-            await self.place_paper_trade(signal)
+            await self.place_paper_trade(signal, entry_candle_ts)
         else:
             await self.place_live_trade(signal)
 
@@ -663,11 +668,17 @@ class BitgetBot:
         for sym in list(self.paper_positions.keys()):
             try:
                 pos = self.paper_positions[sym]
-                candles = await self.fetch_ohlcv(sym, TF_ENTRY, 3)
-                if not candles:
+                candles = await self.fetch_ohlcv(sym, TF_ENTRY, 4)
+                if not candles or len(candles) < 2:
                     continue
 
                 last = candles[-1]
+                last_ts = last[0]
+
+                # Do NOT evaluate the same candle that generated the entry
+                if pos.get("opened_candle_ts") == last_ts:
+                    continue
+
                 high = float(last[2])
                 low  = float(last[3])
 
@@ -841,7 +852,8 @@ class BitgetBot:
                 self.market_debug[symbol] = dbg
 
                 if signal:
-                    await self.place_trade(signal)
+                    entry_candle_ts = c5[-1][0]
+                    await self.place_trade(signal, entry_candle_ts)
 
             except Exception as e:
                 logger.error(f"Scan error {symbol}: {e}")
@@ -939,11 +951,14 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not bot.exchange:
             await safe_edit(q, "❌ Connect first", keyboard())
             return
+
         bot.is_scanning = False
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
+
         bot.is_scanning = True
         for i, sym in enumerate(SYMBOLS):
             asyncio.create_task(bot.scan_symbol(sym, stagger=i * 12))
+
         mode = "PAPER" if PAPER_MODE else "LIVE"
         await safe_edit(
             q,

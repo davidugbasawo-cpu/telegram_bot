@@ -1,13 +1,16 @@
 """
-Bitget Crypto Futures Bot - HYBRID STRATEGY (CORRECTED)
+Bitget Crypto Futures Bot - HYBRID STRATEGY (UPDATED)
 Strategy: Market Regime Detection based on ADX
 - ADX 25-35: TREND (Pullback) → 1:4 RR
 - ADX 20-25: MIXED (Breakout) → 1:2.5 RR  
 - ADX < 20: RANGE (Mean Reversion) → 1:1.5 RR
 - ADX > 35: TREND_CAUTION (Reduced risk) → 1:3 RR
 
-Stop after 5 consecutive losses for the day.
-Paper mode enabled by default.
+Features:
+- Multiple positions allowed (different symbols)
+- Real-time PnL tracking in STATUS
+- Stop after 5 consecutive losses for the day
+- Paper mode enabled by default
 """
 
 import asyncio
@@ -16,7 +19,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import ccxt.async_support as ccxt
@@ -99,7 +102,7 @@ MAX_TRADES_PER_DAY   = 10
 MAX_CONSEC_LOSSES    = 5      # Stop after 5 consecutive losses
 CONSEC_LOSS_PAUSE_HR = 24     # Pause for the day (24 hours)
 COOLDOWN_SEC         = 300
-MAX_OPEN_POSITIONS   = 1
+MAX_OPEN_POSITIONS   = 3      # Changed: Allow one position per symbol (3 total)
 
 # ========================= OTHER =========================
 TRADE_LOG_FILE          = "hybrid_trades.json"
@@ -363,6 +366,14 @@ class HybridBot:
         except Exception as e:
             logger.warning(f"Balance fetch failed: {e}")
 
+    async def get_current_price(self, symbol):
+        """Get current price for a symbol (for PnL calculation)"""
+        try:
+            ticker = await self.exchange.fetch_ticker(symbol)
+            return float(ticker.get("last", 0))
+        except Exception:
+            return 0.0
+
     async def tg(self, text):
         if not self.app:
             return
@@ -375,7 +386,11 @@ class HybridBot:
     def total_open_positions(self):
         return len(self.active_positions) + len(self.paper_positions)
 
-    def can_trade(self):
+    def has_position_for_symbol(self, symbol):
+        """Check if a position already exists for this symbol"""
+        return symbol in self.active_positions or symbol in self.paper_positions
+
+    def can_trade(self, symbol=None):
         self._reset_daily()
 
         if not is_session_active():
@@ -390,8 +405,12 @@ class HybridBot:
             left = int(self.cooldown_until - time.time())
             return False, f"Cooldown {left}s"
 
+        # Check if this symbol already has a position
+        if symbol and self.has_position_for_symbol(symbol):
+            return False, f"Position already exists for {symbol}"
+
         if self.total_open_positions() >= MAX_OPEN_POSITIONS:
-            return False, "Max positions open"
+            return False, f"Max positions open ({MAX_OPEN_POSITIONS})"
 
         if self.trades_today >= MAX_TRADES_PER_DAY:
             return False, f"Daily limit reached ({MAX_TRADES_PER_DAY})"
@@ -1104,10 +1123,11 @@ class HybridBot:
                     await asyncio.sleep(5)
                     continue
 
+                # Check if this symbol already has a position
                 if symbol in self.active_positions or symbol in self.paper_positions:
                     continue
 
-                can, gate = self.can_trade()
+                can, gate = self.can_trade(symbol)
                 if not can:
                     self.market_debug[symbol] = {"time": time.time(), "why": gate, "signal": None}
                     continue
@@ -1225,7 +1245,7 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             q,
             f"{'✅ Connected' if ok else '❌ Failed'} | {mode}\n"
             f"Balance: {bot.balance_usdt:.2f} USDT\n"
-            f"Stop after {MAX_CONSEC_LOSSES} consecutive losses",
+            f"Max positions: {MAX_OPEN_POSITIONS} | Stop after {MAX_CONSEC_LOSSES} consecutive losses",
             keyboard()
         )
 
@@ -1247,6 +1267,7 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🔍 HYBRID SCANNER ACTIVE\n"
             f"Mode: {mode}\n"
             f"Pairs: SOL | XRP | ADA\n"
+            f"Max positions: {MAX_OPEN_POSITIONS} (one per symbol)\n"
             f"Strategies:\n"
             f"  📈 TREND (ADX 25-35): Pullback | 1:4 RR | Full risk\n"
             f"  ⚠️ TREND_CAUTION (ADX > 35): Pullback | 1:3 RR | Half risk\n"
@@ -1309,12 +1330,41 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         for sym, pos in all_positions.items():
             sym_c = sym.replace("/USDT:USDT", "")
-            age   = int(time.time() - pos["opened_at"])
+            age = int(time.time() - pos["opened_at"])
             regime = pos.get("regime", "UNKNOWN")
-            open_pos += (
-                f"\n🔵 {sym_c} {pos['side'].upper()} [{regime}] @ {pos['entry']:.5f} "
-                f"| SL:{pos['stop']:.5f} TP:{pos['target']:.5f} | ({age}s)"
-            )
+            entry = pos["entry"]
+            stop = pos["stop"]
+            target = pos["target"]
+            side = pos["side"]
+            
+            # Get current price for PnL calculation
+            current_price = await bot.get_current_price(sym)
+            
+            if current_price > 0:
+                if side == "buy":
+                    pnl_pct = ((current_price - entry) / entry) * 100
+                    pnl_status = "🟢" if pnl_pct > 0 else "🔴" if pnl_pct < 0 else "⚪"
+                    distance_to_stop = ((current_price - stop) / entry) * 100
+                    distance_to_target = ((target - current_price) / entry) * 100
+                else:
+                    pnl_pct = ((entry - current_price) / entry) * 100
+                    pnl_status = "🟢" if pnl_pct > 0 else "🔴" if pnl_pct < 0 else "⚪"
+                    distance_to_stop = ((stop - current_price) / entry) * 100
+                    distance_to_target = ((current_price - target) / entry) * 100
+                
+                open_pos += (
+                    f"\n{pnl_status} {sym_c} {side.upper()} [{regime}]\n"
+                    f"   Entry: {entry:.5f} | Current: {current_price:.5f}\n"
+                    f"   PnL: {pnl_pct:+.2f}% | SL: {stop:.5f} | TP: {target:.5f}\n"
+                    f"   To Stop: {distance_to_stop:.2f}% | To Target: {distance_to_target:.2f}%\n"
+                    f"   Age: {age}s"
+                )
+            else:
+                open_pos += (
+                    f"\n🔵 {sym_c} {side.upper()} [{regime}] @ {entry:.5f}\n"
+                    f"   SL:{stop:.5f} TP:{target:.5f} | Age: {age}s\n"
+                    f"   ⏳ Price unavailable"
+                )
 
         session_active = is_session_active()
         utc_hour = datetime.utcnow().hour
@@ -1337,12 +1387,13 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📈 PnL Today: {bot.profit_today:+.4f} USDT\n"
             f"📊 Win Rate: {overall_wr:.1f}% ({total_wins}/{total_trades})\n"
             f"📉 Streak: {bot.consec_losses}/{MAX_CONSEC_LOSSES} | Trades: {bot.trades_today}/{MAX_TRADES_PER_DAY}\n"
+            f"📌 Positions: {bot.total_open_positions()}/{MAX_OPEN_POSITIONS}\n"
             f"🕐 Session: {'✅ ACTIVE' if session_active else f'❌ CLOSED ({utc_hour:02d}:00 UTC)'}\n"
             f"🚦 Gate: {gate}{pause_msg}"
         )
 
         if open_pos:
-            header += f"\n\n📌 OPEN POSITIONS:{open_pos}"
+            header += f"\n\n📌 OPEN POSITIONS:\n{open_pos}"
 
         scan_lines = "\n\n📡 LIVE SCAN\n" + "\n".join(
             fmt_debug(sym, bot.market_debug.get(sym, {})) for sym in SYMBOLS
@@ -1363,12 +1414,13 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📊 RANGE (ADX < 20): Mean Reversion at bands | 1:1.5 RR | Half risk\n"
         "🚀 MIXED (ADX 20-25): Breakout + Volume | 1:2.5 RR | 75% risk\n\n"
         f"**RISK MANAGEMENT:**\n"
+        f"Max positions: {MAX_OPEN_POSITIONS} (one per symbol)\n"
         f"Stop after {MAX_CONSEC_LOSSES} consecutive losses (pauses for the day)\n"
         f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n\n"
         "**HOW TO USE:**\n"
         "1. Press CONNECT\n"
         "2. Press START\n"
-        "3. Press STATUS to monitor\n"
+        "3. Press STATUS to monitor (shows live PnL)\n"
         "4. Press WIN RATES to see performance by strategy\n\n"
         "Each trade notification shows which strategy triggered it!",
         reply_markup=keyboard()

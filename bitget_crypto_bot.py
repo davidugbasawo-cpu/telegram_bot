@@ -1,9 +1,10 @@
 """
-Bitget Crypto Futures Bot - HYBRID STRATEGY
-Strategy: Market Regime Detection (TREND / RANGE / MIXED)
-- TREND: Pullback to EMA50 (ADX > 30) → 1:4 RR
-- RANGE: Mean reversion (ADX < 25) → 1:1.5 RR
-- MIXED: Breakout with volume (ADX 25-30) → 1:2.5 RR
+Bitget Crypto Futures Bot - HYBRID STRATEGY (CORRECTED)
+Strategy: Market Regime Detection based on ADX
+- ADX 25-35: TREND (Pullback) → 1:4 RR
+- ADX 20-25: MIXED (Breakout) → 1:2.5 RR  
+- ADX < 20: RANGE (Mean Reversion) → 1:1.5 RR
+- ADX > 35: TREND_CAUTION (Reduced risk) → 1:3 RR
 
 Stop after 5 consecutive losses for the day.
 Paper mode enabled by default.
@@ -27,7 +28,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # ========================= CREDENTIALS =========================
-# WARNING: Revoke these immediately and use environment variables!
 BITGET_API_KEY    = "bg_d0944109a841af8a4167114466af2bf3"
 BITGET_SECRET     = "e2bf8eed9bc0f4963d4c2c325ba19eb03476f9b504341217bbbe7343c80268be"
 BITGET_PASSPHRASE = "Salome1234"
@@ -52,10 +52,11 @@ RSI_PERIOD      = 14
 VOLUME_LOOKBACK = 20
 ATR_PERIOD      = 14
 
-# ========================= REGIME THRESHOLDS =========================
-TREND_ADX_THRESHOLD = 30
-RANGE_ADX_THRESHOLD = 25
-MIN_ATR_PCT_TREND   = 0.008  # 0.8% ATR needed for trend regime
+# ========================= REGIME THRESHOLDS (CORRECTED) =========================
+TREND_MIN_ADX      = 25    # ADX >= 25 = trending (healthy)
+TREND_MAX_ADX      = 35    # ADX > 35 = over-extended (caution)
+WEAK_TREND_MIN     = 20    # ADX 20-25 = weak trend
+# ADX < 20 = choppy/ranging
 
 # ========================= PULLBACK FILTER (TREND STRATEGY) =========================
 PULLBACK_ATR_MULTIPLIER = 0.75
@@ -74,15 +75,17 @@ BREAKOUT_VOLUME_MULT = 1.5
 
 # ========================= RISK/REWARD BY REGIME =========================
 RR_RATIOS = {
-    "TREND": 4.0,    # 1:4
-    "RANGE": 1.5,    # 1:1.5
-    "MIXED": 2.5,    # 1:2.5
+    "TREND": 4.0,           # 1:4 for healthy trends
+    "TREND_CAUTION": 3.0,   # 1:3 for over-extended trends
+    "RANGE": 1.5,           # 1:1.5 for ranging markets
+    "MIXED": 2.5,           # 1:2.5 for weak trends
 }
 
 RISK_MULTIPLIERS = {
-    "TREND": 1.0,    # Full risk
-    "RANGE": 0.5,    # Half risk
-    "MIXED": 0.75,   # 75% risk
+    "TREND": 1.0,           # Full risk
+    "TREND_CAUTION": 0.5,   # Half risk (over-extended)
+    "RANGE": 0.5,           # Half risk
+    "MIXED": 0.75,          # 75% risk
 }
 
 BASE_RISK_PER_TRADE = 0.25  # USDT
@@ -226,7 +229,7 @@ class Signal:
     stop:     float
     target:   float
     reason:   str
-    regime:   str      # TREND, RANGE, or MIXED
+    regime:   str      # TREND, TREND_CAUTION, RANGE, or MIXED
     rr_ratio: float    # The RR used for this trade
 
 
@@ -419,30 +422,29 @@ class HybridBot:
         return []
 
     def determine_regime(self, c15, c5):
-        """Return 'TREND', 'RANGE', or 'MIXED' based on market conditions"""
+        """
+        Return regime based on ADX:
+        - ADX < 20: RANGE (choppy)
+        - ADX 20-25: MIXED (weak trend, wait for breakout)
+        - ADX 25-35: TREND (healthy trend)
+        - ADX > 35: TREND_CAUTION (over-extended, reduce risk)
+        """
         
-        # Calculate ADX on 15M
         adx = adx_value(c15, ADX_PERIOD)
         if adx is None:
             return "MIXED"
         
-        # Calculate ATR percentage on 5M
-        atr = calculate_atr(c5, ATR_PERIOD)
-        if atr is None:
-            return "MIXED"
-        
-        current_price = c5[-1][4]
-        atr_pct = atr / current_price if current_price > 0 else 0
-        
-        # Decision logic
-        if adx > TREND_ADX_THRESHOLD and atr_pct > MIN_ATR_PCT_TREND:
-            return "TREND"
-        elif adx < RANGE_ADX_THRESHOLD:
+        # Regime decision based on ADX
+        if adx < 20:
             return "RANGE"
-        else:
+        elif adx < 25:
             return "MIXED"
+        elif adx <= 35:
+            return "TREND"
+        else:
+            return "TREND_CAUTION"
 
-    def build_signal_trend(self, symbol, c15, c5):
+    def build_signal_trend(self, symbol, c15, c5, is_caution=False):
         """TREND strategy: Pullback to EMA50 with confluence"""
         dbg = {}
 
@@ -466,12 +468,13 @@ class HybridBot:
         if not trend_up and not trend_down:
             return None, f"15M sideways", dbg
 
+        # For trend strategy, we still want ADX > 25
         adx = adx_value(c15, ADX_PERIOD)
-        adx_ok = adx is not None and adx > TREND_ADX_THRESHOLD
+        adx_ok = adx is not None and adx >= TREND_MIN_ADX
         dbg["adx"] = round(adx, 2) if adx else "N/A"
 
         if not adx_ok:
-            return None, f"ADX {dbg['adx']} <= {TREND_ADX_THRESHOLD}", dbg
+            return None, f"ADX {dbg['adx']} < {TREND_MIN_ADX}", dbg
 
         if len(c5) < RSI_PERIOD + VOLUME_LOOKBACK + 5:
             return None, "5M warming up", dbg
@@ -521,8 +524,8 @@ class HybridBot:
         dbg["vol_ok"] = vol_ok
         dbg["body_ok"] = body_ok
 
-        rr_ratio = self.get_rr_ratio("TREND")
-        risk_amount = self.get_risk_per_trade("TREND")
+        regime = "TREND_CAUTION" if is_caution else "TREND"
+        rr_ratio = self.get_rr_ratio(regime)
 
         if trend_up and pullback_bull and bull_candle and body_ok and rsi_ok_buy and vol_ok:
             entry = float(cur_close)
@@ -545,9 +548,9 @@ class HybridBot:
 
             return Signal(
                 "buy", symbol, entry, stop, target,
-                f"TREND: Pullback to EMA50 | ADX:{dbg['adx']} | RSI:{dbg['rsi']}",
-                "TREND", rr_ratio
-            ), f"TREND LONG ✅ (1:{rr_ratio:.0f})", dbg
+                f"{regime}: Pullback to EMA50 | ADX:{dbg['adx']} | RSI:{dbg['rsi']}",
+                regime, rr_ratio
+            ), f"{regime} LONG ✅ (1:{rr_ratio:.0f})", dbg
 
         if trend_down and pullback_bear and bear_candle and body_ok and rsi_ok_sell and vol_ok:
             entry = float(cur_close)
@@ -570,11 +573,11 @@ class HybridBot:
 
             return Signal(
                 "sell", symbol, entry, stop, target,
-                f"TREND: Pullback to EMA50 | ADX:{dbg['adx']} | RSI:{dbg['rsi']}",
-                "TREND", rr_ratio
-            ), f"TREND SHORT ✅ (1:{rr_ratio:.0f})", dbg
+                f"{regime}: Pullback to EMA50 | ADX:{dbg['adx']} | RSI:{dbg['rsi']}",
+                regime, rr_ratio
+            ), f"{regime} SHORT ✅ (1:{rr_ratio:.0f})", dbg
 
-        return None, f"TREND: Waiting for pullback", dbg
+        return None, f"{regime}: Waiting for pullback", dbg
 
     def build_signal_range(self, symbol, c15, c5):
         """RANGE strategy: Mean reversion at EMA20 bands"""
@@ -601,7 +604,6 @@ class HybridBot:
         }
         
         rr_ratio = self.get_rr_ratio("RANGE")
-        risk_amount = self.get_risk_per_trade("RANGE")
         
         # Long at lower band (oversold)
         if current_price < lower_band and rsi and rsi < RANGE_RSI_OVERSOLD:
@@ -652,7 +654,7 @@ class HybridBot:
         return None, f"RANGE: Price {current_price:.5f} between {lower_band:.5f}-{upper_band:.5f}", dbg
 
     def build_signal_breakout(self, symbol, c15, c5):
-        """MIXED strategy: Breakout with volume confirmation"""
+        """MIXED strategy: Breakout with volume confirmation (for weak trends ADX 20-25)"""
         
         current_candle = c5[-1]
         current_price = current_candle[4]
@@ -677,7 +679,6 @@ class HybridBot:
         }
         
         rr_ratio = self.get_rr_ratio("MIXED")
-        risk_amount = self.get_risk_per_trade("MIXED")
         
         # Long on breakout above high with volume spike
         if current_price > high_20 and current_volume > avg_volume * BREAKOUT_VOLUME_MULT:
@@ -727,8 +728,12 @@ class HybridBot:
         regime = self.determine_regime(c15, c5)
         
         if regime == "TREND":
-            signal, reason, dbg = self.build_signal_trend(symbol, c15, c5)
+            signal, reason, dbg = self.build_signal_trend(symbol, c15, c5, is_caution=False)
             dbg["regime"] = "TREND"
+            return signal, reason, dbg
+        elif regime == "TREND_CAUTION":
+            signal, reason, dbg = self.build_signal_trend(symbol, c15, c5, is_caution=True)
+            dbg["regime"] = "TREND_CAUTION"
             return signal, reason, dbg
         elif regime == "RANGE":
             signal, reason, dbg = self.build_signal_range(symbol, c15, c5)
@@ -1243,9 +1248,10 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Mode: {mode}\n"
             f"Pairs: SOL | XRP | ADA\n"
             f"Strategies:\n"
-            f"  📈 TREND (ADX>30): Pullback | 1:4 RR\n"
-            f"  📊 RANGE (ADX<25): Mean Reversion | 1:1.5 RR\n"
-            f"  🚀 MIXED (ADX 25-30): Breakout | 1:2.5 RR\n"
+            f"  📈 TREND (ADX 25-35): Pullback | 1:4 RR | Full risk\n"
+            f"  ⚠️ TREND_CAUTION (ADX > 35): Pullback | 1:3 RR | Half risk\n"
+            f"  📊 RANGE (ADX < 20): Mean Reversion | 1:1.5 RR | Half risk\n"
+            f"  🚀 MIXED (ADX 20-25): Breakout | 1:2.5 RR | 75% risk\n"
             f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
             f"Stop after {MAX_CONSEC_LOSSES} consecutive losses",
             keyboard()
@@ -1351,10 +1357,11 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "💎 Bitget HYBRID Futures Bot\n"
         f"Mode: {mode}\n\n"
-        "**STRATEGIES:**\n"
-        "📈 TREND (ADX > 30): Pullback to EMA50 | 1:4 RR\n"
-        "📊 RANGE (ADX < 25): Mean Reversion | 1:1.5 RR\n"
-        "🚀 MIXED (ADX 25-30): Breakout + Volume | 1:2.5 RR\n\n"
+        "**STRATEGIES (Based on ADX):**\n"
+        "📈 TREND (ADX 25-35): Pullback to EMA50 | 1:4 RR | Full risk\n"
+        "⚠️ TREND_CAUTION (ADX > 35): Pullback | 1:3 RR | Half risk\n"
+        "📊 RANGE (ADX < 20): Mean Reversion at bands | 1:1.5 RR | Half risk\n"
+        "🚀 MIXED (ADX 20-25): Breakout + Volume | 1:2.5 RR | 75% risk\n\n"
         f"**RISK MANAGEMENT:**\n"
         f"Stop after {MAX_CONSEC_LOSSES} consecutive losses (pauses for the day)\n"
         f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n\n"

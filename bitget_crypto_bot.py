@@ -1,9 +1,9 @@
 """
-Bitget Crypto Futures Bot – 1‑Minute Strategy with ADX
-- Trend: 1M EMA200 + ADX ≥ 25
-- Pullback: price returns to 1M EMA50 (within 0.5× ATR)
-- Entry: strong candle (body ≥50%) + volume spike (≥1.2× avg)
-- Risk/reward: 1:2 for all trades
+Bitget Crypto Futures Bot – EMA Cross Strategy (1‑Minute, 1:2 RR)
+- Trend: EMA9 / EMA21 cross
+- Entry: strong candle (body ≥50%) + volume spike (≥1.1× avg)
+- Stop: recent swing low/high + ATR buffer
+- Target: 2× risk
 - Time exit: 1 hour
 - Paper mode enabled
 """
@@ -32,50 +32,46 @@ BITGET_PASSPHRASE = "Salome1234"
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "8697638086:AAG00D0RXUAqXFTjy8-4XO4Bka2kBamo-VA")
 
 USE_TESTNET = False
-PAPER_MODE  = True   # True = simulate trades | False = real orders
+PAPER_MODE  = True
 
 # ========================= MARKETS =========================
 SYMBOLS = ["SOL/USDT:USDT", "BTC/USDT:USDT", "ADA/USDT:USDT"]
 
 # ========================= TIMEFRAMES =========================
 TF_ENTRY = "1m"
-CANDLES_ENTRY = 300   # enough for EMA200, ADX, ATR
+CANDLES = 200   # enough for EMAs, ATR, volume
 
 # ========================= INDICATORS =========================
-TREND_EMA = 200
-PULLBACK_EMA = 50
+EMA_FAST = 9
+EMA_SLOW = 21
 ATR_PERIOD = 14
-RSI_PERIOD = 14
-ADX_PERIOD = 14
-ADX_MIN = 25.0
 VOLUME_LOOKBACK = 20
 
-# ========================= PULLBACK & ENTRY FILTERS =========================
-PULLBACK_ATR_MULTIPLIER = 0.5      # price must be within 0.5× ATR of EMA50
-CANDLE_BODY_RATIO_MIN   = 0.50
-STOP_ATR_MULTIPLIER     = 0.5
-CONF_VOLUME_MULT        = 1.2      # confirmation candle volume > 1.2× average
+# ========================= ENTRY FILTERS =========================
+CANDLE_BODY_RATIO_MIN = 0.50
+VOLUME_MULT = 1.1          # volume > 1.1× average
+STOP_ATR_MULT = 0.5        # stop buffer in ATR
 
 # ========================= RISK/REWARD =========================
-RR_RATIO = 2.0                     # 1:2 for all trades
-BASE_RISK_PER_TRADE = 0.25         # USDT
+RR_RATIO = 2.0
+BASE_RISK_PER_TRADE = 0.25   # USDT
 
 # ========================= TIME EXIT =========================
-MAX_HOLD_HOURS = 1                 # close after 1 hour
+MAX_HOLD_HOURS = 1
 
 # ========================= SESSION =========================
 SESSION_START_UTC = 8
 SESSION_END_UTC   = 21
 
 # ========================= LIMITS =========================
-MAX_TRADES_PER_DAY   = 15
+MAX_TRADES_PER_DAY   = 20
 MAX_CONSEC_LOSSES    = 5
 CONSEC_LOSS_PAUSE_HR = 24
 COOLDOWN_SEC         = 60
 MAX_OPEN_POSITIONS   = 3
 
 # ========================= OTHER =========================
-TRADE_LOG_FILE          = "one_minute_adx_trades.json"
+TRADE_LOG_FILE          = "ema_cross_trades.json"
 SCAN_INTERVAL_SEC       = 15
 STATUS_REFRESH_COOLDOWN = 10
 TIMEZONE                = "Africa/Lagos"
@@ -97,23 +93,6 @@ def candle_body_ratio(candle):
         return 0.0
     return abs(candle[4] - candle[1]) / rng
 
-def rsi_value(closes, period=14):
-    closes = np.array(closes, dtype=float)
-    if len(closes) < period + 1:
-        return None
-    deltas = np.diff(closes)
-    gains = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = float(np.mean(gains[:period]))
-    avg_loss = float(np.mean(losses[:period]))
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return float(100 - (100 / (1 + rs)))
-
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
         return None
@@ -127,48 +106,6 @@ def calculate_atr(candles, period=14):
     if len(tr_values) < period:
         return None
     return sum(tr_values[-period:]) / period
-
-def calculate_adx(candles, period=14):
-    """Calculate ADX on a list of OHLC candles (each candle is [timestamp, open, high, low, close, volume])."""
-    if len(candles) < period * 2 + 1:
-        return None
-    highs = np.array([c[2] for c in candles], dtype=float)
-    lows = np.array([c[3] for c in candles], dtype=float)
-    closes = np.array([c[4] for c in candles], dtype=float)
-
-    tr_list, pdm_list, ndm_list = [], [], []
-    for i in range(1, len(candles)):
-        h, l, pc = highs[i], lows[i], closes[i-1]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        pdm = max(h - highs[i-1], 0) if (h - highs[i-1]) > (lows[i-1] - l) else 0
-        ndm = max(lows[i-1] - l, 0) if (lows[i-1] - l) > (h - highs[i-1]) else 0
-        tr_list.append(tr)
-        pdm_list.append(pdm)
-        ndm_list.append(ndm)
-
-    def smooth(arr, p):
-        s = sum(arr[:p])
-        out = [s]
-        for v in arr[p:]:
-            s = s - s / p + v
-            out.append(s)
-        return out
-
-    atr = smooth(tr_list, period)
-    apdm = smooth(pdm_list, period)
-    andm = smooth(ndm_list, period)
-
-    dx_list = []
-    for i in range(len(atr)):
-        pdi = 100 * apdm[i] / atr[i] if atr[i] else 0
-        ndi = 100 * andm[i] / atr[i] if atr[i] else 0
-        dsum = pdi + ndi
-        dx = 100 * abs(pdi - ndi) / dsum if dsum else 0
-        dx_list.append(dx)
-
-    if len(dx_list) < period:
-        return None
-    return float(np.mean(dx_list[-period:]))
 
 def is_session_active():
     utc_hour = datetime.utcnow().hour
@@ -188,7 +125,7 @@ class Signal:
     rr_ratio: float
 
 # ========================= BOT =========================
-class OneMinuteAdxBot:
+class EmaCrossBot:
     def __init__(self):
         self.exchange          = None
         self.app               = None
@@ -366,75 +303,61 @@ class OneMinuteAdxBot:
         return []
 
     def build_signal(self, symbol, candles):
-        """Single timeframe 1‑minute strategy with ADX."""
+        """EMA cross strategy."""
         dbg = {}
-        if len(candles) < TREND_EMA + ADX_PERIOD + 10:
+        if len(candles) < EMA_SLOW + 20:
             return None, "Not enough data", dbg
 
         closes = [c[4] for c in candles]
-        highs = [c[2] for c in candles]
-        lows = [c[3] for c in candles]
         volumes = [c[5] for c in candles]
 
-        # Trend: EMA200
-        ema200 = ema_value(closes, TREND_EMA)
-        if ema200 is None:
-            return None, "EMA200 not ready", dbg
-        current_price = closes[-1]
-        trend_up = current_price > ema200
-        trend_down = current_price < ema200
-        dbg["trend"] = "UP" if trend_up else "DOWN" if trend_down else "SIDE"
+        # Calculate EMAs
+        ema_fast = ema_value(closes, EMA_FAST)
+        ema_slow = ema_value(closes, EMA_SLOW)
+        if ema_fast is None or ema_slow is None:
+            return None, "EMAs not ready", dbg
 
-        # ADX
-        adx = calculate_adx(candles, ADX_PERIOD)
-        if adx is None:
-            return None, "ADX not ready", dbg
-        adx_ok = adx >= ADX_MIN
-        dbg["adx"] = round(adx, 2)
-        dbg["adx_ok"] = adx_ok
-        if not adx_ok:
-            return None, f"ADX {adx:.1f} < {ADX_MIN}", dbg
+        # Determine cross
+        # Use previous two candles to detect cross
+        if len(candles) < 3:
+            return None, "Not enough candles for cross", dbg
 
-        # Pullback: EMA50 and ATR
-        ema50 = ema_value(closes, PULLBACK_EMA)
-        atr = calculate_atr(candles, ATR_PERIOD)
-        if ema50 is None or atr is None:
-            return None, "Indicators not ready", dbg
+        # Current values
+        fast_prev = ema_value(closes[:-1], EMA_FAST)
+        slow_prev = ema_value(closes[:-1], EMA_SLOW)
+        if fast_prev is None or slow_prev is None:
+            return None, "Previous EMAs not ready", dbg
 
-        # Use the last completed candle as the pullback candle
-        pb_candle = candles[-2]   # second last (fully closed)
-        pb_low = pb_candle[3]
-        pb_high = pb_candle[2]
-        pb_close = pb_candle[4]
-        pb_vol = pb_candle[5]
-        pullback_zone = atr * PULLBACK_ATR_MULTIPLIER
-        touches_zone = abs(pb_low - ema50) <= pullback_zone or abs(pb_high - ema50) <= pullback_zone
-        dbg["touches_zone"] = touches_zone
+        cross_up = fast_prev <= slow_prev and ema_fast > ema_slow
+        cross_down = fast_prev >= slow_prev and ema_fast < ema_slow
 
-        # Pullback candle quality
-        body_ok = candle_body_ratio(pb_candle) >= CANDLE_BODY_RATIO_MIN
-        bull_pb = pb_close > pb_candle[1]
-        bear_pb = pb_close < pb_candle[1]
-        rsi = rsi_value(closes, RSI_PERIOD)
-        rsi_ok_buy = rsi is not None and rsi > 50
-        rsi_ok_sell = rsi is not None and rsi < 50
-
-        avg_vol = sum(volumes[-VOLUME_LOOKBACK-1:-1]) / VOLUME_LOOKBACK if len(volumes) > VOLUME_LOOKBACK else 0
-        vol_ok = pb_vol > avg_vol
-
-        # Confirmation candle (last candle, currently forming)
-        conf_candle = candles[-1]
+        # Confirmation candle is the last closed candle (index -2)
+        conf_candle = candles[-2]
         conf_body_ratio = candle_body_ratio(conf_candle)
         conf_vol = conf_candle[5]
-        avg_vol_1m = sum(volumes[-21:-1]) / 20 if len(volumes) > 21 else 0
-        vol_ok_1m = conf_vol > avg_vol_1m * CONF_VOLUME_MULT
-        conf_strong = conf_body_ratio >= CANDLE_BODY_RATIO_MIN and vol_ok_1m
+        avg_vol = sum(volumes[-VOLUME_LOOKBACK-1:-1]) / VOLUME_LOOKBACK if len(volumes) > VOLUME_LOOKBACK else 0
+        vol_ok = conf_vol > avg_vol * VOLUME_MULT
 
-        # Build signal
-        if trend_up and touches_zone and bull_pb and body_ok and rsi_ok_buy and vol_ok and conf_strong:
-            entry = conf_candle[4]   # close of confirmation candle
-            stop = pb_low - (atr * STOP_ATR_MULTIPLIER)
-            # Ensure stop is not too close
+        # Direction of the confirmation candle must match the cross
+        conf_bull = conf_candle[4] > conf_candle[1]
+        conf_bear = conf_candle[4] < conf_candle[1]
+
+        # ATR for stop
+        atr = calculate_atr(candles, ATR_PERIOD)
+        if atr is None:
+            return None, "ATR not ready", dbg
+
+        # Find recent swing low/high (last 3 candles)
+        recent_lows = [c[3] for c in candles[-4:-1]]
+        recent_highs = [c[2] for c in candles[-4:-1]]
+        swing_low = min(recent_lows)
+        swing_high = max(recent_highs)
+
+        # Entry
+        if cross_up and conf_bull and conf_body_ratio >= CANDLE_BODY_RATIO_MIN and vol_ok:
+            entry = conf_candle[4]
+            stop = swing_low - (atr * STOP_ATR_MULT)
+            # ensure stop not too close
             if entry - stop < entry * 0.0015:
                 stop = entry - (entry * 0.0015)
             if stop >= entry:
@@ -443,13 +366,13 @@ class OneMinuteAdxBot:
             target = entry + risk * RR_RATIO
             return Signal(
                 "buy", symbol, entry, stop, target,
-                f"1M: Trend up, ADX {adx:.1f}, pullback to EMA50, strong confirmation",
+                f"EMA cross up, strong candle, vol spike",
                 RR_RATIO
             ), f"LONG ✅ (1:{RR_RATIO:.0f})", dbg
 
-        if trend_down and touches_zone and bear_pb and body_ok and rsi_ok_sell and vol_ok and conf_strong:
+        if cross_down and conf_bear and conf_body_ratio >= CANDLE_BODY_RATIO_MIN and vol_ok:
             entry = conf_candle[4]
-            stop = pb_high + (atr * STOP_ATR_MULTIPLIER)
+            stop = swing_high + (atr * STOP_ATR_MULT)
             if stop - entry < entry * 0.0015:
                 stop = entry + (entry * 0.0015)
             if stop <= entry:
@@ -458,11 +381,12 @@ class OneMinuteAdxBot:
             target = entry - risk * RR_RATIO
             return Signal(
                 "sell", symbol, entry, stop, target,
-                f"1M: Trend down, ADX {adx:.1f}, pullback to EMA50, strong confirmation",
+                f"EMA cross down, strong candle, vol spike",
                 RR_RATIO
             ), f"SHORT ✅ (1:{RR_RATIO:.0f})", dbg
 
-        return None, f"Waiting for setup (trend: {dbg['trend']}, ADX: {adx:.1f}, touches: {touches_zone})", dbg
+        # No trade
+        return None, f"Waiting for EMA cross (fast:{ema_fast:.2f}, slow:{ema_slow:.2f})", dbg
 
     async def set_leverage(self, symbol):
         try:
@@ -655,7 +579,6 @@ class OneMinuteAdxBot:
         ))
 
     async def reconcile_live_positions(self):
-        # Placeholder for live reconciliation
         pass
 
     async def reconcile(self):
@@ -682,8 +605,7 @@ class OneMinuteAdxBot:
                     self.market_debug[symbol] = {"time": time.time(), "why": gate, "signal": None}
                     continue
 
-                # Fetch 1‑minute candles
-                c1 = await self.fetch_ohlcv(symbol, TF_ENTRY, CANDLES_ENTRY)
+                c1 = await self.fetch_ohlcv(symbol, TF_ENTRY, CANDLES)
                 if not c1:
                     self.market_debug[symbol] = {"time": time.time(), "why": "No candles", "signal": None}
                     await asyncio.sleep(10)
@@ -696,7 +618,7 @@ class OneMinuteAdxBot:
                 self.market_debug[symbol] = dbg
 
                 if signal:
-                    entry_candle_ts = c1[-1][0]  # timestamp of the confirmation candle
+                    entry_candle_ts = c1[-1][0]
                     await self.place_trade(signal, entry_candle_ts)
 
             except Exception as e:
@@ -719,7 +641,7 @@ class OneMinuteAdxBot:
             await asyncio.sleep(60)
 
 # ========================= TELEGRAM UI =========================
-bot = OneMinuteAdxBot()
+bot = EmaCrossBot()
 
 def keyboard():
     return InlineKeyboardMarkup([
@@ -739,16 +661,9 @@ def fmt_debug(sym, d):
     age = int(time.time() - d.get("time", time.time()))
     signal = d.get("signal") or "—"
     why = d.get("why", "—")
-    trend = d.get("trend", "—")
-    adx = d.get("adx", 0)
-    adx_ok = d.get("adx_ok", False)
-    touches_zone = d.get("touches_zone", False)
     sym_c = sym.replace("/USDT:USDT", "")
-    adx_line = f"ADX: {adx:.1f} {'✅' if adx_ok else '❌'} (min {ADX_MIN})"
     return (f"📍 {sym_c} ({age}s)\n"
-            f"Trend: {trend} | {adx_line}\n"
-            f"Pullback zone touched: {'✅' if touches_zone else '❌'}\n"
-            f"Signal: {signal} | {why[:50]}\n")
+            f"Signal: {signal} | {why[:80]}\n")
 
 async def safe_edit(q, text, markup=None):
     try:
@@ -782,12 +697,11 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(bot.scan_symbol(sym, stagger=i*12))
         mode = "PAPER" if PAPER_MODE else "LIVE"
         await safe_edit(q,
-            f"🔍 1‑MINUTE SCANNER ACTIVE (ADX ≥ {ADX_MIN})\n"
+            f"🔍 EMA CROSS SCANNER ACTIVE (1‑Minute)\n"
             f"Mode: {mode}\nPairs: SOL | BTC | ADA\n"
             f"Strategy:\n"
-            f"  📈 Trend: 1M EMA200 + ADX ≥ {ADX_MIN}\n"
-            f"  📉 Pullback: price to 1M EMA50 (within 0.5× ATR)\n"
-            f"  ⚡ Entry: strong candle (body ≥50%) + volume ≥1.2× avg\n"
+            f"  📈 EMA 9/21 cross (trend)\n"
+            f"  ⚡ Entry: strong candle (body ≥50%) + volume ≥1.1× avg\n"
             f"  🎯 Risk/Reward: 1:{RR_RATIO:.0f}\n"
             f"  ⏱ Time exit: {MAX_HOLD_HOURS} hour(s)\n"
             f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
@@ -877,12 +791,11 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot._chat_ids.add(update.message.chat_id)
     mode = "PAPER" if PAPER_MODE else "LIVE"
     await update.message.reply_text(
-        "💎 Bitget 1‑Minute Bot (ADX)\n"
+        "💎 EMA Cross Bot (1‑Minute, 1:2 RR)\n"
         f"Mode: {mode}\n\n"
         "**STRATEGY:**\n"
-        f"📈 1M EMA200 trend + ADX ≥ {ADX_MIN}\n"
-        "📉 1M EMA50 pullback (0.5× ATR zone)\n"
-        "⚡ Entry: strong candle (body ≥50%) + volume spike (≥1.2× avg)\n"
+        "📈 EMA 9/21 cross detects trend\n"
+        "⚡ Entry: strong candle (body ≥50%) + volume spike (≥1.1× avg)\n"
         "🎯 Risk/Reward: 1:2\n"
         "⏱ Time exit: 1 hour\n\n"
         f"**RISK:** Stop after {MAX_CONSEC_LOSSES} losses, max {MAX_OPEN_POSITIONS} positions\n"

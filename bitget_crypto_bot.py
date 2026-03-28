@@ -1,15 +1,11 @@
 """
-Bitget Crypto Futures Bot - HYBRID STRATEGY (1:2 RR, Time Exit, RANGE Disabled)
-Strategy: Market Regime Detection based on ADX
-- ADX >=25: TREND (Pullback) → 1:2 RR
-- ADX >35: TREND_CAUTION (Reduced risk) → 1:2 RR
-- ADX 20-25: MIXED (Breakout) → 1:2.5 RR
-- ADX <20: RANGE (disabled temporarily)
-
-Features:
-- Time-based exit after 12 hours
-- Wider stops (0.75x ATR)
-- Paper mode enabled by default
+Bitget Crypto Futures Bot – Multi‑Timeframe (15M/5M/1M) with Sharp Entry Filters
+- 15M EMA50 trend + ADX ≥25
+- 5M pullback to EMA50 with confluence (RSI, volume, candle body)
+- 1M confirmation: close beyond 5M extreme + body ≥50% + volume spike (1.2× avg)
+- Risk/reward: 1:2 for TREND & TREND_CAUTION, 1:2.5 for MIXED
+- Time exit: close after 1 hour
+- Paper mode enabled
 """
 
 import asyncio
@@ -43,9 +39,11 @@ SYMBOLS = ["SOL/USDT:USDT", "BTC/USDT:USDT", "ADA/USDT:USDT"]
 
 # ========================= TIMEFRAMES =========================
 TF_TREND    = "15m"
-TF_ENTRY    = "5m"
-CANDLES_15M = 150
-CANDLES_5M  = 80
+TF_PULLBACK = "5m"
+TF_ENTRY    = "1m"
+CANDLES_TREND    = 150
+CANDLES_PULLBACK = 80
+CANDLES_ENTRY    = 50
 
 # ========================= INDICATORS =========================
 EMA_PERIOD      = 50
@@ -55,27 +53,33 @@ VOLUME_LOOKBACK = 20
 ATR_PERIOD      = 14
 
 # ========================= REGIME THRESHOLDS =========================
-TREND_MIN_ADX      = 25    # ADX >=25 = trending
-TREND_MAX_ADX      = 35    # ADX >35 = caution
-WEAK_TREND_MIN     = 20    # ADX 20-25 = weak trend
+TREND_MIN_ADX      = 25
+TREND_MAX_ADX      = 35
+WEAK_TREND_MIN     = 20
 
-# ========================= PULLBACK FILTER (TREND STRATEGY) =========================
-PULLBACK_ATR_MULTIPLIER = 0.75
+# ========================= PULLBACK FILTER =========================
+PULLBACK_ATR_MULTIPLIER = 0.5      # 0.5× ATR zone around EMA50
 CANDLE_BODY_RATIO_MIN   = 0.50
-STOP_ATR_MULTIPLIER     = 0.75   # Wider stops (was 0.5)
+STOP_ATR_MULTIPLIER     = 0.5
 
-# ========================= RISK/REWARD (UPDATED) =========================
-# TREND and TREND_CAUTION now use 1:2 RR
+# ========================= 1M CONFIRMATION FILTERS =========================
+CONF_BODY_RATIO_MIN = 0.50          # 50% body
+CONF_VOLUME_MULT    = 1.2           # volume > 1.2× average
+
+# ========================= RANGE STRATEGY (DISABLED) =========================
+RANGE_ENABLED = False
+
+# ========================= RISK/REWARD =========================
 RR_RATIOS = {
     "TREND": 2.0,           # 1:2
-    "TREND_CAUTION": 2.0,   # 1:2
-    "RANGE": 1.5,           # (disabled, kept for completeness)
-    "MIXED": 2.5,           # 1:2.5 (unchanged)
+    "TREND_CAUTION": 2.0,
+    "RANGE": 1.5,
+    "MIXED": 2.5,
 }
 
 RISK_MULTIPLIERS = {
     "TREND": 1.0,
-    "TREND_CAUTION": 0.5,   # Half risk for over‑extended trends
+    "TREND_CAUTION": 0.5,
     "RANGE": 0.5,
     "MIXED": 0.75,
 }
@@ -83,13 +87,9 @@ RISK_MULTIPLIERS = {
 BASE_RISK_PER_TRADE = 0.25  # USDT
 
 # ========================= TIME EXIT =========================
-MAX_HOLD_HOURS = 12          # Close trade after 12 hours if not closed by SL/TP
+MAX_HOLD_HOURS = 1          # close after 1 hour
 
-# ========================= RANGE STRATEGY (DISABLED) =========================
-# Set to True to re‑enable later
-RANGE_ENABLED = False
-
-# ========================= SESSION FILTER =========================
+# ========================= SESSION =========================
 SESSION_START_UTC = 8
 SESSION_END_UTC   = 21
 
@@ -101,12 +101,12 @@ COOLDOWN_SEC         = 300
 MAX_OPEN_POSITIONS   = 3
 
 # ========================= OTHER =========================
-TRADE_LOG_FILE          = "hybrid_trades.json"
+TRADE_LOG_FILE          = "sharp_trades.json"
 SCAN_INTERVAL_SEC       = 15
 STATUS_REFRESH_COOLDOWN = 10
 TIMEZONE                = "Africa/Lagos"
 
-# ========================= HELPERS (unchanged) =========================
+# ========================= HELPERS =========================
 def ema_value(closes, period):
     closes = np.array(closes, dtype=float)
     if len(closes) < period:
@@ -149,10 +149,10 @@ def adx_value(candles, period=14):
 
     tr_list, pdm_list, ndm_list = [], [], []
     for i in range(1, len(candles)):
-        h, l, pc = highs[i], lows[i], closes[i - 1]
+        h, l, pc = highs[i], lows[i], closes[i-1]
         tr = max(h - l, abs(h - pc), abs(l - pc))
-        pdm = max(h - highs[i - 1], 0) if (h - highs[i - 1]) > (lows[i - 1] - l) else 0
-        ndm = max(lows[i - 1] - l, 0) if (lows[i - 1] - l) > (h - highs[i - 1]) else 0
+        pdm = max(h - highs[i-1], 0) if (h - highs[i-1]) > (lows[i-1] - l) else 0
+        ndm = max(lows[i-1] - l, 0) if (lows[i-1] - l) > (h - highs[i-1]) else 0
         tr_list.append(tr)
         pdm_list.append(pdm)
         ndm_list.append(ndm)
@@ -420,76 +420,65 @@ class HybridBot:
         else:
             return "RANGE"
 
-    def build_signal_trend(self, symbol, c15, c5, is_caution=False):
+    # ------------------------------------------------------------------
+    # TREND strategy with 1M confirmation
+    # ------------------------------------------------------------------
+    def build_signal_trend(self, symbol, c15, c5, c1, is_caution=False):
         dbg = {}
+        # 15M trend check
         if len(c15) < EMA_PERIOD + 5:
             return None, "15M warming up", dbg
-
         cl15 = [x[4] for x in c15]
         price15 = cl15[-1]
         ema50_15 = ema_value(cl15, EMA_PERIOD)
         if ema50_15 is None:
             return None, "EMA50 not ready", dbg
-
         trend_up = price15 > ema50_15
         trend_down = price15 < ema50_15
         dbg["ema50_15"] = round(ema50_15, 5)
         dbg["price15"] = round(price15, 5)
         dbg["trend"] = "UP" if trend_up else "DOWN" if trend_down else "SIDE"
-
         if not trend_up and not trend_down:
             return None, "15M sideways", dbg
-
         adx = adx_value(c15, ADX_PERIOD)
-        trend_min = TREND_MIN_ADX
-        adx_ok = adx is not None and adx >= trend_min
+        adx_ok = adx is not None and adx >= TREND_MIN_ADX
         dbg["adx"] = round(adx, 2) if adx else "N/A"
         if not adx_ok:
-            return None, f"ADX {dbg['adx']} < {trend_min}", dbg
+            return None, f"ADX {dbg['adx']} < {TREND_MIN_ADX}", dbg
 
+        # 5M pullback data
         if len(c5) < RSI_PERIOD + VOLUME_LOOKBACK + 5:
             return None, "5M warming up", dbg
-
         cl5 = [x[4] for x in c5]
         vol5 = [x[5] for x in c5]
         cur5 = c5[-1]
         prev5 = c5[-2]
-
         cur_open = cur5[1]
         cur_high = cur5[2]
         cur_low = cur5[3]
         cur_close = cur5[4]
         cur_vol = cur5[5]
-
         ema50_5m = ema_value(cl5, EMA_PERIOD)
         if ema50_5m is None:
             return None, "5M EMA50 not ready", dbg
-
         rsi = rsi_value(cl5, RSI_PERIOD)
         rsi_ok_buy = rsi is not None and rsi > 50
         rsi_ok_sell = rsi is not None and rsi < 50
-
         avg_vol = float(np.mean(vol5[-(VOLUME_LOOKBACK+1):-1])) if len(vol5) > VOLUME_LOOKBACK else 0
         vol_ok = avg_vol == 0 or cur_vol > avg_vol
-
         cur_body = candle_body_ratio(cur5)
         body_ok = cur_body >= CANDLE_BODY_RATIO_MIN
-
         bull_candle = cur_close > cur_open
         bear_candle = cur_close < cur_open
-
         prev_low = prev5[3]
         prev_high = prev5[2]
-
         atr = calculate_atr(c5, ATR_PERIOD)
         if atr:
             pullback_zone = atr * PULLBACK_ATR_MULTIPLIER
         else:
             pullback_zone = ema50_5m * 0.003
-
         pullback_bull = abs(prev_low - ema50_5m) <= pullback_zone
         pullback_bear = abs(prev_high - ema50_5m) <= pullback_zone
-
         dbg["ema50_5m"] = round(ema50_5m, 5)
         dbg["rsi"] = round(rsi, 2) if rsi else "N/A"
         dbg["vol_ok"] = vol_ok
@@ -498,41 +487,63 @@ class HybridBot:
         regime = "TREND_CAUTION" if is_caution else "TREND"
         rr_ratio = self.get_rr_ratio(regime)
 
-        if trend_up and pullback_bull and bull_candle and body_ok and rsi_ok_buy and vol_ok:
-            entry = float(cur_close)
-            stop = float(cur_low)
-            if atr:
-                min_stop_distance = atr * STOP_ATR_MULTIPLIER
-                if (entry - stop) < min_stop_distance:
-                    stop = entry - min_stop_distance
-            min_sl = entry * 0.0015
-            if (entry - stop) < min_sl:
-                stop = entry - min_sl
-            if stop >= entry:
-                return None, "Invalid long SL >= entry", dbg
-            risk = entry - stop
-            target = entry + risk * rr_ratio
-            return Signal("buy", symbol, entry, stop, target,
-                          f"{regime}: Pullback to EMA50 | ADX:{dbg['adx']} | RSI:{dbg['rsi']}",
-                          regime, rr_ratio), f"{regime} LONG ✅ (1:{rr_ratio:.0f})", dbg
+        # 1M confirmation
+        if len(c1) < 3:
+            return None, "Not enough 1M data", dbg
+        conf_candle = c1[-2]          # last closed 1M candle
+        conf_open = conf_candle[1]
+        conf_high = conf_candle[2]
+        conf_low = conf_candle[3]
+        conf_close = conf_candle[4]
+        conf_vol = conf_candle[5]
+        conf_body_ratio = abs(conf_close - conf_open) / (conf_high - conf_low + 1e-12)
+        vols_1m = [x[5] for x in c1[-21:-1]]
+        avg_vol_1m = sum(vols_1m) / len(vols_1m) if vols_1m else 0
+        vol_ok_1m = conf_vol > avg_vol_1m * CONF_VOLUME_MULT
 
+        # Long conditions
+        if trend_up and pullback_bull and bull_candle and body_ok and rsi_ok_buy and vol_ok:
+            if conf_close > prev_high and conf_body_ratio >= CONF_BODY_RATIO_MIN and vol_ok_1m:
+                entry = float(cur_close)
+                stop = float(cur_low)
+                if atr:
+                    min_stop_distance = atr * STOP_ATR_MULTIPLIER
+                    if (entry - stop) < min_stop_distance:
+                        stop = entry - min_stop_distance
+                min_sl = entry * 0.0015
+                if (entry - stop) < min_sl:
+                    stop = entry - min_sl
+                if stop >= entry:
+                    return None, "Invalid long SL >= entry", dbg
+                risk = entry - stop
+                target = entry + risk * rr_ratio
+                return Signal("buy", symbol, entry, stop, target,
+                              f"{regime}: Pullback to EMA50 | ADX:{dbg['adx']} | RSI:{dbg['rsi']}",
+                              regime, rr_ratio), f"{regime} LONG ✅ (1:{rr_ratio:.0f})", dbg
+            else:
+                return None, f"{regime}: 1M weak (body {conf_body_ratio:.2f}, vol {conf_vol:.0f})", dbg
+
+        # Short conditions
         if trend_down and pullback_bear and bear_candle and body_ok and rsi_ok_sell and vol_ok:
-            entry = float(cur_close)
-            stop = float(cur_high)
-            if atr:
-                min_stop_distance = atr * STOP_ATR_MULTIPLIER
-                if (stop - entry) < min_stop_distance:
-                    stop = entry + min_stop_distance
-            min_sl = entry * 0.0015
-            if (stop - entry) < min_sl:
-                stop = entry + min_sl
-            if stop <= entry:
-                return None, "Invalid short SL <= entry", dbg
-            risk = stop - entry
-            target = entry - risk * rr_ratio
-            return Signal("sell", symbol, entry, stop, target,
-                          f"{regime}: Pullback to EMA50 | ADX:{dbg['adx']} | RSI:{dbg['rsi']}",
-                          regime, rr_ratio), f"{regime} SHORT ✅ (1:{rr_ratio:.0f})", dbg
+            if conf_close < prev_low and conf_body_ratio >= CONF_BODY_RATIO_MIN and vol_ok_1m:
+                entry = float(cur_close)
+                stop = float(cur_high)
+                if atr:
+                    min_stop_distance = atr * STOP_ATR_MULTIPLIER
+                    if (stop - entry) < min_stop_distance:
+                        stop = entry + min_stop_distance
+                min_sl = entry * 0.0015
+                if (stop - entry) < min_sl:
+                    stop = entry + min_sl
+                if stop <= entry:
+                    return None, "Invalid short SL <= entry", dbg
+                risk = stop - entry
+                target = entry - risk * rr_ratio
+                return Signal("sell", symbol, entry, stop, target,
+                              f"{regime}: Pullback to EMA50 | ADX:{dbg['adx']} | RSI:{dbg['rsi']}",
+                              regime, rr_ratio), f"{regime} SHORT ✅ (1:{rr_ratio:.0f})", dbg
+            else:
+                return None, f"{regime}: 1M weak (body {conf_body_ratio:.2f}, vol {conf_vol:.0f})", dbg
 
         return None, f"{regime}: Waiting for pullback", dbg
 
@@ -542,27 +553,26 @@ class HybridBot:
     def build_signal_range(self, symbol, c15, c5):
         if not RANGE_ENABLED:
             return None, "RANGE strategy disabled", {}
-        # Original code kept but unreachable; if re-enabled, would need strengthening
-        return None, "RANGE strategy disabled (temporarily)", {}
+        return None, "RANGE disabled", {}
 
     # ------------------------------------------------------------------
-    # MIXED strategy (unchanged, still 1:2.5)
+    # MIXED strategy (unchanged)
     # ------------------------------------------------------------------
     def build_signal_breakout(self, symbol, c15, c5):
         current_candle = c5[-1]
         current_price = current_candle[4]
         current_volume = current_candle[5]
-        highs_20 = [c[2] for c in c5[-BREAKOUT_PERIOD:]]
-        lows_20 = [c[3] for c in c5[-BREAKOUT_PERIOD:]]
+        highs_20 = [c[2] for c in c5[-20:]]
+        lows_20 = [c[3] for c in c5[-20:]]
         high_20 = max(highs_20)
         low_20 = min(lows_20)
-        volumes = [c[5] for c in c5[-BREAKOUT_PERIOD-1:-1]]
+        volumes = [c[5] for c in c5[-21:-1]]
         avg_volume = sum(volumes) / len(volumes) if volumes else 0
         atr = calculate_atr(c5, ATR_PERIOD)
         dbg = {"high_20": round(high_20,5), "low_20": round(low_20,5),
                "volume_spike": round(current_volume/avg_volume,2) if avg_volume else 0}
         rr_ratio = self.get_rr_ratio("MIXED")
-        if current_price > high_20 and current_volume > avg_volume * BREAKOUT_VOLUME_MULT:
+        if current_price > high_20 and current_volume > avg_volume * 1.5:
             entry = current_price
             stop = high_20
             if atr and (entry - stop) < atr * 0.5:
@@ -574,7 +584,7 @@ class HybridBot:
             return Signal("buy", symbol, entry, stop, target,
                           f"MIXED: Breakout above {high_20:.5f} | Vol:{dbg['volume_spike']}x",
                           "MIXED", rr_ratio), f"MIXED LONG ✅ (1:{rr_ratio:.1f})", dbg
-        elif current_price < low_20 and current_volume > avg_volume * BREAKOUT_VOLUME_MULT:
+        elif current_price < low_20 and current_volume > avg_volume * 1.5:
             entry = current_price
             stop = low_20
             if atr and (stop - entry) < atr * 0.5:
@@ -588,27 +598,27 @@ class HybridBot:
                           "MIXED", rr_ratio), f"MIXED SHORT ✅ (1:{rr_ratio:.1f})", dbg
         return None, f"MIXED: No breakout", dbg
 
-    async def build_signal_hybrid(self, symbol, c15, c5):
+    async def build_signal_hybrid(self, symbol, c15, c5, c1):
         regime = self.determine_regime(c15, c5)
         if regime == "TREND":
-            signal, reason, dbg = self.build_signal_trend(symbol, c15, c5, is_caution=False)
+            signal, reason, dbg = self.build_signal_trend(symbol, c15, c5, c1, is_caution=False)
             dbg["regime"] = "TREND"
             return signal, reason, dbg
         elif regime == "TREND_CAUTION":
-            signal, reason, dbg = self.build_signal_trend(symbol, c15, c5, is_caution=True)
+            signal, reason, dbg = self.build_signal_trend(symbol, c15, c5, c1, is_caution=True)
             dbg["regime"] = "TREND_CAUTION"
             return signal, reason, dbg
         elif regime == "RANGE":
             signal, reason, dbg = self.build_signal_range(symbol, c15, c5)
             dbg["regime"] = "RANGE"
             return signal, reason, dbg
-        else:  # MIXED
+        else:
             signal, reason, dbg = self.build_signal_breakout(symbol, c15, c5)
             dbg["regime"] = "MIXED"
             return signal, reason, dbg
 
     # ------------------------------------------------------------------
-    # Order placement and reconciliation (with time exit)
+    # Order placement and reconciliation (unchanged except time exit)
     # ------------------------------------------------------------------
     async def set_leverage(self, symbol):
         try:
@@ -709,9 +719,6 @@ class HybridBot:
         else:
             await self.place_live_trade(signal)
 
-    # ------------------------------------------------------------------
-    # Reconciliation with time exit
-    # ------------------------------------------------------------------
     async def reconcile_paper_positions(self):
         if not self.exchange or not self.paper_positions:
             return
@@ -737,10 +744,9 @@ class HybridBot:
                 result = None
                 pnl = 0.0
 
-                # Time exit check
+                # Time exit
                 age = time.time() - pos["opened_at"]
                 if age > MAX_HOLD_HOURS * 3600:
-                    # Close at current market price (mid of last candle)
                     current_price = (high + low) / 2
                     if side == "buy":
                         pnl = ((current_price - entry) / entry) * risk_amount
@@ -808,9 +814,7 @@ class HybridBot:
         ))
 
     async def reconcile_live_positions(self):
-        # Similar time exit for live trades would require order cancellations/close orders.
-        # For brevity, we skip live time exit in this version; you can extend similarly.
-        # Current focus is paper mode for validation.
+        # For live, you can implement similar time exit; keep placeholder
         pass
 
     async def reconcile(self):
@@ -836,25 +840,30 @@ class HybridBot:
                 if not can:
                     self.market_debug[symbol] = {"time": time.time(), "why": gate, "signal": None}
                     continue
-                self.market_debug[symbol] = {"time": time.time(), "why": "Fetching candles...", "signal": None}
-                c15 = await self.fetch_ohlcv(symbol, TF_TREND, CANDLES_15M)
-                await asyncio.sleep(0.3)
-                c5 = await self.fetch_ohlcv(symbol, TF_ENTRY, CANDLES_5M)
-                if not c15 or not c5:
-                    msg = " | ".join([f"{tf}:0 candles" for tf, d in [(TF_TREND,c15),(TF_ENTRY,c5)] if not d])
-                    logger.warning(f"{symbol}: {msg}")
-                    self.market_debug[symbol] = {"time": time.time(), "why": msg, "signal": None}
+
+                # Fetch all three timeframes
+                c15 = await self.fetch_ohlcv(symbol, TF_TREND, CANDLES_TREND)
+                await asyncio.sleep(0.2)
+                c5 = await self.fetch_ohlcv(symbol, TF_PULLBACK, CANDLES_PULLBACK)
+                await asyncio.sleep(0.2)
+                c1 = await self.fetch_ohlcv(symbol, TF_ENTRY, CANDLES_ENTRY)
+
+                if not c15 or not c5 or not c1:
+                    self.market_debug[symbol] = {"time": time.time(), "why": "Missing candles", "signal": None}
                     await asyncio.sleep(10)
                     continue
-                signal, reason, dbg = await self.build_signal_hybrid(symbol, c15, c5)
+
+                signal, reason, dbg = await self.build_signal_hybrid(symbol, c15, c5, c1)
                 dbg["time"] = time.time()
                 dbg["why"] = reason
                 dbg["signal"] = signal.side.upper() if signal else None
                 dbg["regime"] = signal.regime if signal else dbg.get("regime", "UNKNOWN")
                 self.market_debug[symbol] = dbg
+
                 if signal:
-                    entry_candle_ts = c5[-1][0]
+                    entry_candle_ts = c1[-1][0]  # latest 1M candle timestamp
                     await self.place_trade(signal, entry_candle_ts)
+
             except Exception as e:
                 logger.error(f"Scan error {symbol}: {e}")
                 self.market_debug[symbol] = {"time": time.time(), "why": f"Error: {str(e)[:100]}", "signal": None}
@@ -874,7 +883,7 @@ class HybridBot:
         while True:
             await asyncio.sleep(60)
 
-# ========================= TELEGRAM UI (unchanged except for status messages) =========================
+# ========================= TELEGRAM UI =========================
 bot = HybridBot()
 
 def keyboard():
@@ -941,14 +950,16 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(bot.scan_symbol(sym, stagger=i*12))
         mode = "PAPER" if PAPER_MODE else "LIVE"
         await safe_edit(q,
-            f"🔍 HYBRID SCANNER ACTIVE (1:2 RR, Time Exit)\nMode: {mode}\nPairs: SOL | BTC | ADA\n"
+            f"🔍 HYBRID SCANNER ACTIVE (Sharp Entries)\n"
+            f"Mode: {mode}\nPairs: SOL | BTC | ADA\n"
             f"Max positions: {MAX_OPEN_POSITIONS} (one per symbol)\n"
             f"Strategies:\n"
-            f"  📈 TREND (ADX 25-35): Pullback | 1:2 RR | Full risk\n"
-            f"  ⚠️ TREND_CAUTION (ADX >35): Pullback | 1:2 RR | Half risk\n"
-            f"  🚀 MIXED (ADX 20-25): Breakout | 1:2.5 RR | 75% risk\n"
-            f"  📊 RANGE: temporarily disabled\n"
-            f"Time exit: {MAX_HOLD_HOURS} hours\n"
+            f"  📈 TREND (ADX 25-35): Pullback + 1M confirm | 1:2 RR\n"
+            f"  ⚠️ TREND_CAUTION (ADX >35): Pullback + 1M confirm | 1:2 RR\n"
+            f"  🚀 MIXED (ADX 20-25): Breakout | 1:2.5 RR\n"
+            f"  📊 RANGE: disabled\n"
+            f"1M filters: close >5M extreme, body ≥50%, volume ≥1.2×\n"
+            f"Time exit: {MAX_HOLD_HOURS} hour(s)\n"
             f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
             f"Stop after {MAX_CONSEC_LOSSES} consecutive losses", keyboard())
     elif q.data == "STOP":
@@ -1044,19 +1055,17 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot._chat_ids.add(update.message.chat_id)
     mode = "PAPER" if PAPER_MODE else "LIVE"
     await update.message.reply_text(
-        "💎 Bitget HYBRID Futures Bot (1:2 RR, Time Exit)\n"
+        "💎 Bitget Hybrid Bot (Sharp Entries)\n"
         f"Mode: {mode}\n\n"
-        "**STRATEGIES:**\n"
-        "📈 TREND (ADX 25-35): Pullback to EMA50 | 1:2 RR | Full risk\n"
-        "⚠️ TREND_CAUTION (ADX >35): Pullback | 1:2 RR | Half risk\n"
-        "🚀 MIXED (ADX 20-25): Breakout + Volume | 1:2.5 RR | 75% risk\n"
-        "📊 RANGE: temporarily disabled\n\n"
-        "**Risk Management:**\n"
-        f"- Stop after {MAX_CONSEC_LOSSES} consecutive losses (24h pause)\n"
-        f"- Time exit: close after {MAX_HOLD_HOURS} hours if not closed\n"
-        f"- Max positions: {MAX_OPEN_POSITIONS} (one per symbol)\n"
-        f"- Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n\n"
-        "**How to use:**\n1. CONNECT\n2. START\n3. STATUS (live PnL)\n4. WIN RATES",
+        "**STRATEGY:**\n"
+        "📈 15M trend + ADX\n"
+        "📉 5M pullback to EMA50\n"
+        "⚡ 1M confirmation: close >5M extreme, body ≥50%, volume ≥1.2× avg\n"
+        "🎯 Risk/Reward: 1:2 (TREND), 1:2.5 (MIXED)\n"
+        "⏱ Time exit: 1 hour\n\n"
+        f"**RISK:** Stop after {MAX_CONSEC_LOSSES} losses, max {MAX_OPEN_POSITIONS} positions\n"
+        f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n\n"
+        "**USE:** CONNECT → START → STATUS",
         reply_markup=keyboard()
     )
 

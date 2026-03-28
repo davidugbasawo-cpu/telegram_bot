@@ -1,10 +1,8 @@
 """
-Bitget Crypto Futures Bot – EMA Cross Strategy (1‑Minute, 1:2 RR)
-- Trend: EMA9 / EMA21 cross
-- Entry: strong candle (body ≥50%) + volume spike (≥1.1× avg)
-- Stop: recent swing low/high + ATR buffer
-- Target: 2× risk
-- Time exit: 1 hour
+Bitget Crypto Futures Bot – Enhanced EMA Cross (1m + 5m, 1:2 RR, Trailing Stop)
+- 5m trend filter, recent cross detection, continuation candle
+- Adaptive ATR, EMA gap, volume spike
+- Stop: swing low/ATR, break-even after 1R, trailing stop
 - Paper mode enabled
 """
 
@@ -14,7 +12,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import ccxt.async_support as ccxt
@@ -38,8 +36,10 @@ PAPER_MODE  = True
 SYMBOLS = ["SOL/USDT:USDT", "BTC/USDT:USDT", "ADA/USDT:USDT"]
 
 # ========================= TIMEFRAMES =========================
-TF_ENTRY = "1m"
-CANDLES = 200   # enough for EMAs, ATR, volume
+TF_1M = "1m"
+TF_5M = "5m"
+CANDLES_1M = 200
+CANDLES_5M = 100
 
 # ========================= INDICATORS =========================
 EMA_FAST = 9
@@ -47,17 +47,27 @@ EMA_SLOW = 21
 ATR_PERIOD = 14
 VOLUME_LOOKBACK = 20
 
+# ========================= RECENT CROSS =========================
+RECENT_CROSS_LOOKBACK = 3
+MIN_EMA_GAP_PCT = 0.04
+
 # ========================= ENTRY FILTERS =========================
 CANDLE_BODY_RATIO_MIN = 0.50
-VOLUME_MULT = 1.1          # volume > 1.1× average
-STOP_ATR_MULT = 0.5        # stop buffer in ATR
+VOLUME_MULT = 1.2
+STOP_ATR_MULT = 0.7
+
+# ========================= ADAPTIVE ATR =========================
+ATR_AVG_LOOKBACK = 20
+ATR_MIN_RATIO = 0.9
 
 # ========================= RISK/REWARD =========================
 RR_RATIO = 2.0
-BASE_RISK_PER_TRADE = 0.25   # USDT
+BASE_RISK_PER_TRADE = 0.25   # change to 1.0 for live if you wish
 
-# ========================= TIME EXIT =========================
-MAX_HOLD_HOURS = 1
+# ========================= BREAK-EVEN & TRAILING =========================
+BREAK_EVEN_AFTER_1R = True
+TRAIL_ACTIVATION_PCT = 0.35
+TRAIL_DISTANCE_PCT = 0.20
 
 # ========================= SESSION =========================
 SESSION_START_UTC = 8
@@ -71,7 +81,7 @@ COOLDOWN_SEC         = 60
 MAX_OPEN_POSITIONS   = 3
 
 # ========================= OTHER =========================
-TRADE_LOG_FILE          = "ema_cross_trades.json"
+TRADE_LOG_FILE          = "enhanced_trades.json"
 SCAN_INTERVAL_SEC       = 15
 STATUS_REFRESH_COOLDOWN = 10
 TIMEZONE                = "Africa/Lagos"
@@ -125,7 +135,7 @@ class Signal:
     rr_ratio: float
 
 # ========================= BOT =========================
-class EmaCrossBot:
+class EnhancedBot:
     def __init__(self):
         self.exchange          = None
         self.app               = None
@@ -302,62 +312,97 @@ class EmaCrossBot:
         logger.error(f"OHLCV {symbol} {tf}: All attempts failed")
         return []
 
-    def build_signal(self, symbol, candles):
-        """EMA cross strategy."""
+    # ------------------------------------------------------------------
+    # ENHANCED SIGNAL BUILDER (5m + 1m, recent cross, continuation)
+    # ------------------------------------------------------------------
+    def build_signal(self, symbol, candles_1m, candles_5m):
         dbg = {}
-        if len(candles) < EMA_SLOW + 20:
-            return None, "Not enough data", dbg
+        if len(candles_1m) < EMA_SLOW + RECENT_CROSS_LOOKBACK + 5:
+            return None, "Not enough 1m data", dbg
+        if len(candles_5m) < EMA_SLOW + 5:
+            return None, "Not enough 5m data", dbg
 
-        closes = [c[4] for c in candles]
-        volumes = [c[5] for c in candles]
+        # ----- 5m trend filter -----
+        closes_5m = [c[4] for c in candles_5m]
+        ema9_5m = ema_value(closes_5m, EMA_FAST)
+        ema21_5m = ema_value(closes_5m, EMA_SLOW)
+        if ema9_5m is None or ema21_5m is None:
+            return None, "5m EMAs not ready", dbg
+        trend_up_5m = ema9_5m > ema21_5m
+        trend_down_5m = ema9_5m < ema21_5m
 
-        # Calculate EMAs
-        ema_fast = ema_value(closes, EMA_FAST)
-        ema_slow = ema_value(closes, EMA_SLOW)
-        if ema_fast is None or ema_slow is None:
-            return None, "EMAs not ready", dbg
+        # ----- 1m data -----
+        closes = [c[4] for c in candles_1m]
+        volumes = [c[5] for c in candles_1m]
+        current_price = closes[-1]
 
-        # Determine cross
-        # Use previous two candles to detect cross
-        if len(candles) < 3:
-            return None, "Not enough candles for cross", dbg
+        # EMAs
+        ema9 = ema_value(closes, EMA_FAST)
+        ema21 = ema_value(closes, EMA_SLOW)
+        if ema9 is None or ema21 is None:
+            return None, "1m EMAs not ready", dbg
 
-        # Current values
-        fast_prev = ema_value(closes[:-1], EMA_FAST)
-        slow_prev = ema_value(closes[:-1], EMA_SLOW)
-        if fast_prev is None or slow_prev is None:
-            return None, "Previous EMAs not ready", dbg
+        # EMA gap filter
+        ema_gap_pct = abs(ema9 - ema21) / current_price * 100
+        if ema_gap_pct < MIN_EMA_GAP_PCT:
+            return None, f"EMA gap too small ({ema_gap_pct:.2f}% < {MIN_EMA_GAP_PCT}%)", dbg
 
-        cross_up = fast_prev <= slow_prev and ema_fast > ema_slow
-        cross_down = fast_prev >= slow_prev and ema_fast < ema_slow
+        # Recent cross detection
+        cross_up_recent = False
+        cross_down_recent = False
+        for i in range(1, RECENT_CROSS_LOOKBACK + 1):
+            if len(closes) < i + 2:
+                continue
+            ema9_prev = ema_value(closes[:-i], EMA_FAST)
+            ema21_prev = ema_value(closes[:-i], EMA_SLOW)
+            if ema9_prev is None or ema21_prev is None:
+                continue
+            if ema9_prev <= ema21_prev and ema9 > ema21:
+                cross_up_recent = True
+            if ema9_prev >= ema21_prev and ema9 < ema21:
+                cross_down_recent = True
 
-        # Confirmation candle is the last closed candle (index -2)
-        conf_candle = candles[-2]
+        # Continuation candle (last closed candle)
+        conf_candle = candles_1m[-1]
         conf_body_ratio = candle_body_ratio(conf_candle)
         conf_vol = conf_candle[5]
         avg_vol = sum(volumes[-VOLUME_LOOKBACK-1:-1]) / VOLUME_LOOKBACK if len(volumes) > VOLUME_LOOKBACK else 0
         vol_ok = conf_vol > avg_vol * VOLUME_MULT
-
-        # Direction of the confirmation candle must match the cross
         conf_bull = conf_candle[4] > conf_candle[1]
         conf_bear = conf_candle[4] < conf_candle[1]
+        conf_above_ema9 = conf_candle[4] > ema9
+        conf_below_ema9 = conf_candle[4] < ema9
 
-        # ATR for stop
-        atr = calculate_atr(candles, ATR_PERIOD)
+        # ATR & adaptive volatility
+        atr = calculate_atr(candles_1m, ATR_PERIOD)
         if atr is None:
             return None, "ATR not ready", dbg
 
-        # Find recent swing low/high (last 3 candles)
-        recent_lows = [c[3] for c in candles[-4:-1]]
-        recent_highs = [c[2] for c in candles[-4:-1]]
+        if len(candles_1m) >= ATR_AVG_LOOKBACK + 2:
+            atr_vals = []
+            for i in range(ATR_AVG_LOOKBACK):
+                sub_candles = candles_1m[-(ATR_AVG_LOOKBACK+2+i):-i-1] if i > 0 else candles_1m[-ATR_AVG_LOOKBACK-2:-1]
+                sub_atr = calculate_atr(sub_candles, ATR_PERIOD)
+                if sub_atr is not None:
+                    atr_vals.append(sub_atr)
+            avg_atr = sum(atr_vals) / len(atr_vals) if atr_vals else atr
+            if atr < avg_atr * ATR_MIN_RATIO:
+                return None, f"Low volatility (ATR {atr:.5f} < {ATR_MIN_RATIO*100:.0f}% of avg {avg_atr:.5f})", dbg
+
+        # Recent swing levels (last 5 candles)
+        recent_lows = [c[3] for c in candles_1m[-6:-1]]
+        recent_highs = [c[2] for c in candles_1m[-6:-1]]
         swing_low = min(recent_lows)
         swing_high = max(recent_highs)
 
-        # Entry
-        if cross_up and conf_bull and conf_body_ratio >= CANDLE_BODY_RATIO_MIN and vol_ok:
+        # ----- Buy signal -----
+        if (trend_up_5m and cross_up_recent and conf_bull and conf_above_ema9 and
+            conf_body_ratio >= CANDLE_BODY_RATIO_MIN and vol_ok):
             entry = conf_candle[4]
-            stop = swing_low - (atr * STOP_ATR_MULT)
-            # ensure stop not too close
+            # Stop: min of swing low and ATR-based level
+            stop_candidate = swing_low - (atr * STOP_ATR_MULT)
+            stop = min(swing_low, stop_candidate)
+            # Minimum distance protection
             if entry - stop < entry * 0.0015:
                 stop = entry - (entry * 0.0015)
             if stop >= entry:
@@ -366,13 +411,16 @@ class EmaCrossBot:
             target = entry + risk * RR_RATIO
             return Signal(
                 "buy", symbol, entry, stop, target,
-                f"EMA cross up, strong candle, vol spike",
+                f"5m up | recent cross | strong cont | vol spike",
                 RR_RATIO
             ), f"LONG ✅ (1:{RR_RATIO:.0f})", dbg
 
-        if cross_down and conf_bear and conf_body_ratio >= CANDLE_BODY_RATIO_MIN and vol_ok:
+        # ----- Sell signal -----
+        if (trend_down_5m and cross_down_recent and conf_bear and conf_below_ema9 and
+            conf_body_ratio >= CANDLE_BODY_RATIO_MIN and vol_ok):
             entry = conf_candle[4]
-            stop = swing_high + (atr * STOP_ATR_MULT)
+            stop_candidate = swing_high + (atr * STOP_ATR_MULT)
+            stop = max(swing_high, stop_candidate)
             if stop - entry < entry * 0.0015:
                 stop = entry + (entry * 0.0015)
             if stop <= entry:
@@ -381,12 +429,12 @@ class EmaCrossBot:
             target = entry - risk * RR_RATIO
             return Signal(
                 "sell", symbol, entry, stop, target,
-                f"EMA cross down, strong candle, vol spike",
+                f"5m down | recent cross | strong cont | vol spike",
                 RR_RATIO
             ), f"SHORT ✅ (1:{RR_RATIO:.0f})", dbg
 
         # No trade
-        return None, f"Waiting for EMA cross (fast:{ema_fast:.2f}, slow:{ema_slow:.2f})", dbg
+        return None, f"Waiting (5m: {'up' if trend_up_5m else 'down' if trend_down_5m else 'side'}, cross_up:{cross_up_recent}, cross_down:{cross_down_recent})", dbg
 
     async def set_leverage(self, symbol):
         try:
@@ -419,6 +467,9 @@ class EmaCrossBot:
             "target": signal.target, "opened_at": time.time(),
             "opened_candle_ts": entry_candle_ts, "size": 0.0,
             "reason": signal.reason, "rr_ratio": signal.rr_ratio,
+            "highest_price": signal.entry,   # for trailing
+            "lowest_price": signal.entry,
+            "breakeven_activated": False,
         }
         self.trades_today += 1
         self.cooldown_until = time.time() + COOLDOWN_SEC
@@ -463,6 +514,9 @@ class EmaCrossBot:
                 "side": signal.side, "size": size, "entry": avg_price, "stop": signal.stop,
                 "target": signal.target, "opened_at": time.time(),
                 "rr_ratio": signal.rr_ratio,
+                "highest_price": avg_price,
+                "lowest_price": avg_price,
+                "breakeven_activated": False,
             }
             self.trades_today += 1
             self.cooldown_until = time.time() + COOLDOWN_SEC
@@ -485,13 +539,16 @@ class EmaCrossBot:
         else:
             await self.place_live_trade(signal)
 
+    # ------------------------------------------------------------------
+    # RECONCILIATION (break-even + trailing stop)
+    # ------------------------------------------------------------------
     async def reconcile_paper_positions(self):
         if not self.exchange or not self.paper_positions:
             return
         for sym in list(self.paper_positions.keys()):
             try:
                 pos = self.paper_positions[sym]
-                candles = await self.fetch_ohlcv(sym, TF_ENTRY, 4)
+                candles = await self.fetch_ohlcv(sym, TF_1M, 4)
                 if not candles or len(candles) < 2:
                     continue
                 last = candles[-1]
@@ -500,39 +557,71 @@ class EmaCrossBot:
                     continue
                 high = float(last[2])
                 low = float(last[3])
+                current_price = (high + low) / 2
+
                 side = pos["side"]
-                entry = float(pos["entry"])
-                stop = float(pos["stop"])
-                target = float(pos["target"])
-                rr_ratio = pos.get("rr_ratio", 2.0)
+                entry = pos["entry"]
+                stop = pos["stop"]
+                target = pos["target"]
+                rr_ratio = pos.get("rr_ratio", RR_RATIO)
                 risk_amount = BASE_RISK_PER_TRADE
+
+                # Update highest/lowest
+                if side == "buy":
+                    highest = pos.get("highest_price", entry)
+                    if current_price > highest:
+                        highest = current_price
+                        pos["highest_price"] = highest
+                    profit_pct = (highest - entry) / entry * 100
+
+                    # Break-even after 1R
+                    if BREAK_EVEN_AFTER_1R and not pos.get("breakeven_activated", False):
+                        risk_pct = (entry - stop) / entry * 100
+                        if profit_pct >= risk_pct:
+                            # Move stop to entry
+                            new_stop = entry
+                            pos["stop"] = new_stop
+                            pos["breakeven_activated"] = True
+                            await self.tg(f"🔒 {sym.replace('/USDT:USDT','')} BE activated → stop moved to entry")
+                    # Trailing stop
+                    if profit_pct >= TRAIL_ACTIVATION_PCT:
+                        trail_stop = highest * (1 - TRAIL_DISTANCE_PCT / 100)
+                        if trail_stop > stop:
+                            pos["stop"] = trail_stop
+
+                else:  # short
+                    lowest = pos.get("lowest_price", entry)
+                    if current_price < lowest:
+                        lowest = current_price
+                        pos["lowest_price"] = lowest
+                    profit_pct = (entry - lowest) / entry * 100
+
+                    if BREAK_EVEN_AFTER_1R and not pos.get("breakeven_activated", False):
+                        risk_pct = (stop - entry) / entry * 100
+                        if profit_pct >= risk_pct:
+                            new_stop = entry
+                            pos["stop"] = new_stop
+                            pos["breakeven_activated"] = True
+                            await self.tg(f"🔒 {sym.replace('/USDT:USDT','')} BE activated → stop moved to entry")
+                    if profit_pct >= TRAIL_ACTIVATION_PCT:
+                        trail_stop = lowest * (1 + TRAIL_DISTANCE_PCT / 100)
+                        if trail_stop < stop:
+                            pos["stop"] = trail_stop
+
+                # Use updated stop for checking
+                new_stop = pos["stop"]
+                # Check stop/target
                 result = None
                 pnl = 0.0
-
-                # Time exit
-                age = time.time() - pos["opened_at"]
-                if age > MAX_HOLD_HOURS * 3600:
-                    current_price = (high + low) / 2
-                    if side == "buy":
-                        pnl = ((current_price - entry) / entry) * risk_amount
-                        result = "WIN" if pnl > 0 else "LOSS"
-                    else:
-                        pnl = ((entry - current_price) / entry) * risk_amount
-                        result = "WIN" if pnl > 0 else "LOSS"
-                    self.paper_positions.pop(sym, None)
-                    self._close_trade(sym, pnl, result, rr_ratio, "time_exit")
-                    continue
-
-                # Normal stop/target
                 if side == "buy":
-                    if low <= stop:
+                    if low <= new_stop:
                         result = "LOSS"
                         pnl = -risk_amount
                     elif high >= target:
                         result = "WIN"
                         pnl = risk_amount * rr_ratio
                 else:
-                    if high >= stop:
+                    if high >= new_stop:
                         result = "LOSS"
                         pnl = -risk_amount
                     elif low <= target:
@@ -540,15 +629,19 @@ class EmaCrossBot:
                         pnl = risk_amount * rr_ratio
 
                 if result is None:
+                    # Update position in dict if stop changed
+                    if new_stop != stop:
+                        self.paper_positions[sym] = pos
                     continue
 
+                # Trade closed
                 self.paper_positions.pop(sym, None)
-                self._close_trade(sym, pnl, result, rr_ratio, "normal")
+                self._close_trade(sym, pnl, result, rr_ratio, side, entry, stop, target)
 
             except Exception as e:
                 logger.warning(f"Paper reconcile error {sym}: {e}")
 
-    def _close_trade(self, sym, pnl, result, rr_ratio, close_type):
+    def _close_trade(self, sym, pnl, result, rr_ratio, side, entry, stop, target):
         if pnl < 0:
             self.consec_losses += 1
             self.losses_today += 1
@@ -561,11 +654,19 @@ class EmaCrossBot:
                 ))
         else:
             self.consec_losses = 0
+
         self.profit_today = round(self.profit_today + pnl, 4)
         self._save_trade({
-            "time": time.time(), "symbol": sym, "side": pos["side"], "entry": pos["entry"],
-            "stop": pos["stop"], "target": pos["target"], "pnl": pnl, "mode": "paper",
-            "result": result, "rr_ratio": rr_ratio, "close_type": close_type,
+            "time": time.time(),
+            "symbol": sym,
+            "side": side,
+            "entry": entry,
+            "stop": stop,
+            "target": target,
+            "pnl": pnl,
+            "mode": "paper",
+            "result": result,
+            "rr_ratio": rr_ratio,
         })
         sym_clean = sym.replace("/USDT:USDT", "")
         stats = self.win_rate_stats.get(sym, {"wins": 0, "losses": 0})
@@ -573,12 +674,14 @@ class EmaCrossBot:
         wr = (stats["wins"] / total * 100) if total > 0 else 0
         asyncio.create_task(self.tg(
             f"{'✅ PAPER WIN' if pnl >= 0 else '❌ PAPER LOSS'} | {sym_clean}\n"
-            f"PnL: {pnl:+.4f} USDT (1:{rr_ratio:.1f} RR)\nToday: {self.profit_today:+.4f} USDT\n"
+            f"PnL: {pnl:+.4f} USDT (1:{rr_ratio:.1f} RR)\n"
+            f"Today: {self.profit_today:+.4f} USDT\n"
             f"Streak: {self.consec_losses}/{MAX_CONSEC_LOSSES}\n"
             f"Win Rate {sym_clean}: {wr:.1f}% ({stats['wins']}/{total})"
         ))
 
     async def reconcile_live_positions(self):
+        # For live, similar logic would be needed but we keep placeholder.
         pass
 
     async def reconcile(self):
@@ -605,13 +708,16 @@ class EmaCrossBot:
                     self.market_debug[symbol] = {"time": time.time(), "why": gate, "signal": None}
                     continue
 
-                c1 = await self.fetch_ohlcv(symbol, TF_ENTRY, CANDLES)
-                if not c1:
+                # Fetch 1m and 5m candles
+                c1 = await self.fetch_ohlcv(symbol, TF_1M, CANDLES_1M)
+                await asyncio.sleep(0.2)
+                c5 = await self.fetch_ohlcv(symbol, TF_5M, CANDLES_5M)
+                if not c1 or not c5:
                     self.market_debug[symbol] = {"time": time.time(), "why": "No candles", "signal": None}
                     await asyncio.sleep(10)
                     continue
 
-                signal, reason, dbg = self.build_signal(symbol, c1)
+                signal, reason, dbg = self.build_signal(symbol, c1, c5)
                 dbg["time"] = time.time()
                 dbg["why"] = reason
                 dbg["signal"] = signal.side.upper() if signal else None
@@ -641,7 +747,7 @@ class EmaCrossBot:
             await asyncio.sleep(60)
 
 # ========================= TELEGRAM UI =========================
-bot = EmaCrossBot()
+bot = EnhancedBot()
 
 def keyboard():
     return InlineKeyboardMarkup([
@@ -697,13 +803,13 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(bot.scan_symbol(sym, stagger=i*12))
         mode = "PAPER" if PAPER_MODE else "LIVE"
         await safe_edit(q,
-            f"🔍 EMA CROSS SCANNER ACTIVE (1‑Minute)\n"
+            f"🔍 ENHANCED EMA CROSS SCANNER (1m+5m, 1:2 RR)\n"
             f"Mode: {mode}\nPairs: SOL | BTC | ADA\n"
             f"Strategy:\n"
-            f"  📈 EMA 9/21 cross (trend)\n"
-            f"  ⚡ Entry: strong candle (body ≥50%) + volume ≥1.1× avg\n"
-            f"  🎯 Risk/Reward: 1:{RR_RATIO:.0f}\n"
-            f"  ⏱ Time exit: {MAX_HOLD_HOURS} hour(s)\n"
+            f"  📈 5m trend filter\n"
+            f"  ⚡ Recent cross + continuation candle\n"
+            f"  🔒 Break-even after 1R, trailing stop\n"
+            f"  🌊 Adaptive ATR, EMA gap, volume spike\n"
             f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
             f"Stop after {MAX_CONSEC_LOSSES} consecutive losses", keyboard())
     elif q.data == "STOP":
@@ -791,13 +897,13 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot._chat_ids.add(update.message.chat_id)
     mode = "PAPER" if PAPER_MODE else "LIVE"
     await update.message.reply_text(
-        "💎 EMA Cross Bot (1‑Minute, 1:2 RR)\n"
+        "💎 Enhanced EMA Cross Bot (1m+5m, 1:2 RR, Trailing Stop)\n"
         f"Mode: {mode}\n\n"
         "**STRATEGY:**\n"
-        "📈 EMA 9/21 cross detects trend\n"
-        "⚡ Entry: strong candle (body ≥50%) + volume spike (≥1.1× avg)\n"
-        "🎯 Risk/Reward: 1:2\n"
-        "⏱ Time exit: 1 hour\n\n"
+        "📈 5m trend filter (EMA9/21)\n"
+        "⚡ Recent 1m EMA cross + continuation candle\n"
+        "🔒 Break-even after 1R, then trailing stop\n"
+        "🌊 Adaptive ATR, EMA gap, volume spike\n\n"
         f"**RISK:** Stop after {MAX_CONSEC_LOSSES} losses, max {MAX_OPEN_POSITIONS} positions\n"
         f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n\n"
         "**USE:** CONNECT → START → STATUS",

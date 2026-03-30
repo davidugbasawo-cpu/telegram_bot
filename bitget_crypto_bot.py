@@ -1,9 +1,9 @@
 """
-Bitget Crypto Futures Bot – 1‑Minute Momentum Breakout
-- Entry: price breaks 5‑period high/low + volume spike (1.2× avg)
-- Stop: recent swing + ATR buffer
-- Target: 2× risk (1:2 RR)
-- Trailing stop: activate at 0.5% profit, trail 0.3%
+Bitget Crypto Futures Bot – Breakout with ADX Trend Filter (1‑Minute, 1:2 RR)
+- 5‑minute ADX ≥ 25 to confirm strong trend
+- Breakout of 5‑period high/low on 1‑minute + volume spike
+- Trade only in direction of 5‑minute EMA20
+- 1:2 risk/reward, trailing stop, break‑even
 - Paper mode enabled
 """
 
@@ -37,18 +37,25 @@ PAPER_MODE  = True
 SYMBOLS = ["SOL/USDT:USDT", "BTC/USDT:USDT", "ADA/USDT:USDT"]
 
 # ========================= TIMEFRAMES =========================
-TF_ENTRY = "1m"
-CANDLES = 100   # enough for lookback and volume
+TF_1M = "1m"
+TF_5M = "5m"
+CANDLES_1M = 100
+CANDLES_5M = 60        # enough for ADX and EMA20
+
+# ========================= ADX & TREND FILTER =========================
+ADX_PERIOD = 14
+ADX_MIN = 25            # require strong trend
+EMA_PERIOD_5M = 20
 
 # ========================= BREAKOUT SETTINGS =========================
-LOOKBACK_PERIOD = 5          # highest/lowest of last N candles
+LOOKBACK_PERIOD = 5
 VOLUME_LOOKBACK = 20
-VOLUME_MULT = 1.2            # volume spike multiplier
+VOLUME_MULT = 1.2
 
 # ========================= STOP & TARGET =========================
-STOP_ATR_MULT = 0.5          # stop distance in ATR
-RR_RATIO = 2.0               # 1:2
-BASE_RISK_PER_TRADE = 0.25   # change to 1.0 for $1 risk
+STOP_ATR_MULT = 0.5
+RR_RATIO = 2.0
+BASE_RISK_PER_TRADE = 0.25
 
 # ========================= TRAILING STOP =========================
 TRAIL_ACTIVATION_PCT = 0.5
@@ -66,12 +73,22 @@ COOLDOWN_SEC         = 60
 MAX_OPEN_POSITIONS   = 3
 
 # ========================= OTHER =========================
-TRADE_LOG_FILE          = "momentum_trades.json"
+TRADE_LOG_FILE          = "adx_breakout_trades.json"
 SCAN_INTERVAL_SEC       = 15
 STATUS_REFRESH_COOLDOWN = 10
 TIMEZONE                = "Africa/Lagos"
 
 # ========================= HELPERS =========================
+def ema_value(closes, period):
+    closes = np.array(closes, dtype=float)
+    if len(closes) < period:
+        return None
+    k = 2.0 / (period + 1)
+    ema = float(np.mean(closes[:period]))
+    for c in closes[period:]:
+        ema = c * k + ema * (1 - k)
+    return float(ema)
+
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
         return None
@@ -85,6 +102,48 @@ def calculate_atr(candles, period=14):
     if len(tr_values) < period:
         return None
     return sum(tr_values[-period:]) / period
+
+def calculate_adx(candles, period=14):
+    """Calculate ADX on a list of OHLC candles."""
+    if len(candles) < period * 2 + 1:
+        return None
+    highs = np.array([c[2] for c in candles], dtype=float)
+    lows = np.array([c[3] for c in candles], dtype=float)
+    closes = np.array([c[4] for c in candles], dtype=float)
+
+    tr_list, pdm_list, ndm_list = [], [], []
+    for i in range(1, len(candles)):
+        h, l, pc = highs[i], lows[i], closes[i-1]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        pdm = max(h - highs[i-1], 0) if (h - highs[i-1]) > (lows[i-1] - l) else 0
+        ndm = max(lows[i-1] - l, 0) if (lows[i-1] - l) > (h - highs[i-1]) else 0
+        tr_list.append(tr)
+        pdm_list.append(pdm)
+        ndm_list.append(ndm)
+
+    def smooth(arr, p):
+        s = sum(arr[:p])
+        out = [s]
+        for v in arr[p:]:
+            s = s - s / p + v
+            out.append(s)
+        return out
+
+    atr = smooth(tr_list, period)
+    apdm = smooth(pdm_list, period)
+    andm = smooth(ndm_list, period)
+
+    dx_list = []
+    for i in range(len(atr)):
+        pdi = 100 * apdm[i] / atr[i] if atr[i] else 0
+        ndi = 100 * andm[i] / atr[i] if atr[i] else 0
+        dsum = pdi + ndi
+        dx = 100 * abs(pdi - ndi) / dsum if dsum else 0
+        dx_list.append(dx)
+
+    if len(dx_list) < period:
+        return None
+    return float(np.mean(dx_list[-period:]))
 
 def is_session_active():
     utc_hour = datetime.utcnow().hour
@@ -104,7 +163,7 @@ class Signal:
     rr_ratio: float
 
 # ========================= BOT =========================
-class MomentumBot:
+class AdxBreakoutBot:
     def __init__(self):
         self.exchange          = None
         self.app               = None
@@ -281,35 +340,52 @@ class MomentumBot:
         logger.error(f"OHLCV {symbol} {tf}: All attempts failed")
         return []
 
-    def build_signal(self, symbol, candles):
-        """Simple momentum breakout on 1‑minute chart."""
+    def build_signal(self, symbol, candles_1m, candles_5m):
+        """Breakout strategy with ADX trend filter on 5m."""
         dbg = {}
-        if len(candles) < LOOKBACK_PERIOD + VOLUME_LOOKBACK + 5:
-            return None, "Not enough data", dbg
+        if len(candles_1m) < LOOKBACK_PERIOD + VOLUME_LOOKBACK + 5:
+            return None, "Not enough 1m data", dbg
+        if len(candles_5m) < ADX_PERIOD + EMA_PERIOD_5M + 5:
+            return None, "Not enough 5m data", dbg
 
-        # Get recent candles
-        recent = candles[-LOOKBACK_PERIOD-1:-1]  # last LOOKBACK_PERIOD closed candles
-        current = candles[-1]  # last closed candle (confirmation)
-        
-        # Highest high and lowest low of recent candles
+        # ----- 5m ADX and trend direction -----
+        adx = calculate_adx(candles_5m, ADX_PERIOD)
+        if adx is None:
+            return None, "ADX not ready", dbg
+        dbg["adx"] = round(adx, 2)
+
+        # 5m EMA20 for direction
+        closes_5m = [c[4] for c in candles_5m]
+        ema20_5m = ema_value(closes_5m, EMA_PERIOD_5M)
+        if ema20_5m is None:
+            return None, "5m EMA not ready", dbg
+        current_price_5m = closes_5m[-1]
+        trend_up_5m = current_price_5m > ema20_5m
+        trend_down_5m = current_price_5m < ema20_5m
+
+        # Only trade if ADX ≥ 25 (strong trend)
+        if adx < ADX_MIN:
+            return None, f"ADX {adx:.1f} < {ADX_MIN} – weak trend", dbg
+
+        # ----- 1m breakout detection -----
+        recent = candles_1m[-LOOKBACK_PERIOD-1:-1]  # last LOOKBACK_PERIOD closed candles
+        current = candles_1m[-1]                   # last closed candle
+
         highest_high = max(c[2] for c in recent)
         lowest_low = min(c[3] for c in recent)
-        
-        # Volume check
-        volumes = [c[5] for c in candles]
+
+        volumes = [c[5] for c in candles_1m]
         avg_vol = sum(volumes[-VOLUME_LOOKBACK-1:-1]) / VOLUME_LOOKBACK if len(volumes) > VOLUME_LOOKBACK else 0
         vol_ok = current[5] > avg_vol * VOLUME_MULT
-        
-        # ATR for stop distance
-        atr = calculate_atr(candles, 14)
+
+        atr = calculate_atr(candles_1m, 14)
         if atr is None:
             return None, "ATR not ready", dbg
-        
-        # Long signal: close above highest high
-        if current[4] > highest_high and vol_ok:
+
+        # Long breakout
+        if current[4] > highest_high and vol_ok and trend_up_5m:
             entry = current[4]
             stop = lowest_low - (atr * STOP_ATR_MULT)
-            # Minimum distance protection
             if entry - stop < entry * 0.0015:
                 stop = entry - (entry * 0.0015)
             if stop >= entry:
@@ -318,12 +394,12 @@ class MomentumBot:
             target = entry + risk * RR_RATIO
             return Signal(
                 "buy", symbol, entry, stop, target,
-                f"Breakout above {highest_high:.5f}, vol spike",
+                f"Breakout above {highest_high:.5f}, ADX {adx:.1f}, vol spike",
                 RR_RATIO
             ), f"LONG ✅ (1:{RR_RATIO:.0f})", dbg
-        
-        # Short signal: close below lowest low
-        if current[4] < lowest_low and vol_ok:
+
+        # Short breakout
+        if current[4] < lowest_low and vol_ok and trend_down_5m:
             entry = current[4]
             stop = highest_high + (atr * STOP_ATR_MULT)
             if stop - entry < entry * 0.0015:
@@ -334,11 +410,12 @@ class MomentumBot:
             target = entry - risk * RR_RATIO
             return Signal(
                 "sell", symbol, entry, stop, target,
-                f"Breakdown below {lowest_low:.5f}, vol spike",
+                f"Breakdown below {lowest_low:.5f}, ADX {adx:.1f}, vol spike",
                 RR_RATIO
             ), f"SHORT ✅ (1:{RR_RATIO:.0f})", dbg
-        
-        return None, f"Waiting for breakout (high:{highest_high:.5f}, low:{lowest_low:.5f})", dbg
+
+        # No trade
+        return None, f"ADX {adx:.1f} {'↑' if trend_up_5m else '↓' if trend_down_5m else '→'} | Waiting for breakout (H:{highest_high:.5f} L:{lowest_low:.5f})", dbg
 
     async def set_leverage(self, symbol):
         try:
@@ -452,7 +529,7 @@ class MomentumBot:
         for sym in list(self.paper_positions.keys()):
             try:
                 pos = self.paper_positions[sym]
-                candles = await self.fetch_ohlcv(sym, TF_ENTRY, 4)
+                candles = await self.fetch_ohlcv(sym, TF_1M, 4)
                 if not candles or len(candles) < 2:
                     continue
                 last = candles[-1]
@@ -581,7 +658,6 @@ class MomentumBot:
         ))
 
     async def reconcile_live_positions(self):
-        # Placeholder for live – same logic would apply
         pass
 
     async def reconcile(self):
@@ -608,13 +684,16 @@ class MomentumBot:
                     self.market_debug[symbol] = {"time": time.time(), "why": gate, "signal": None}
                     continue
 
-                c1 = await self.fetch_ohlcv(symbol, TF_ENTRY, CANDLES)
-                if not c1:
+                # Fetch 1m and 5m candles
+                c1 = await self.fetch_ohlcv(symbol, TF_1M, CANDLES_1M)
+                await asyncio.sleep(0.2)
+                c5 = await self.fetch_ohlcv(symbol, TF_5M, CANDLES_5M)
+                if not c1 or not c5:
                     self.market_debug[symbol] = {"time": time.time(), "why": "No candles", "signal": None}
                     await asyncio.sleep(10)
                     continue
 
-                signal, reason, dbg = self.build_signal(symbol, c1)
+                signal, reason, dbg = self.build_signal(symbol, c1, c5)
                 dbg["time"] = time.time()
                 dbg["why"] = reason
                 dbg["signal"] = signal.side.upper() if signal else None
@@ -644,7 +723,7 @@ class MomentumBot:
             await asyncio.sleep(60)
 
 # ========================= TELEGRAM UI =========================
-bot = MomentumBot()
+bot = AdxBreakoutBot()
 
 def keyboard():
     return InlineKeyboardMarkup([
@@ -700,12 +779,13 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(bot.scan_symbol(sym, stagger=i*12))
         mode = "PAPER" if PAPER_MODE else "LIVE"
         await safe_edit(q,
-            f"🔍 MOMENTUM BREAKOUT SCANNER (1‑Minute)\n"
+            f"🔍 ADX BREAKOUT SCANNER (1‑Minute, 1:2 RR)\n"
             f"Mode: {mode}\nPairs: SOL | BTC | ADA\n"
             f"Strategy:\n"
-            f"  🚀 Breakout of {LOOKBACK_PERIOD}‑period high/low + volume spike\n"
-            f"  🎯 1:2 RR, trailing stop (activate {TRAIL_ACTIVATION_PCT}%, trail {TRAIL_DISTANCE_PCT}%)\n"
-            f"  🔒 Break‑even after 1R\n"
+            f"  📈 5‑min ADX ≥ {ADX_MIN} (strong trend)\n"
+            f"  🚀 1‑min breakout of {LOOKBACK_PERIOD}‑period high/low + volume spike\n"
+            f"  🧭 Trade only in direction of 5‑min EMA20\n"
+            f"  🎯 1:2 RR, trailing stop, break‑even after 1R\n"
             f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
             f"Stop after {MAX_CONSEC_LOSSES} consecutive losses", keyboard())
     elif q.data == "STOP":
@@ -793,12 +873,13 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot._chat_ids.add(update.message.chat_id)
     mode = "PAPER" if PAPER_MODE else "LIVE"
     await update.message.reply_text(
-        "💎 Momentum Breakout Bot (1‑Minute, 1:2 RR)\n"
+        "💎 ADX Breakout Bot (1‑Minute, 1:2 RR)\n"
         f"Mode: {mode}\n\n"
         "**STRATEGY:**\n"
-        "🚀 Buy when price breaks highest high of last 5 candles + volume spike\n"
-        "🔻 Sell when price breaks lowest low of last 5 candles + volume spike\n"
-        "🎯 1:2 risk/reward, trailing stop, break‑even after 1R\n\n"
+        f"📈 5‑min ADX ≥ {ADX_MIN} → strong trend only\n"
+        "🚀 1‑min breakout of 5‑period high/low + volume spike\n"
+        "🧭 Trade only in direction of 5‑min EMA20\n"
+        "🎯 1:2 RR, trailing stop, break‑even after 1R\n\n"
         f"**RISK:** Stop after {MAX_CONSEC_LOSSES} losses, max {MAX_OPEN_POSITIONS} positions\n"
         f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n\n"
         "**USE:** CONNECT → START → STATUS",

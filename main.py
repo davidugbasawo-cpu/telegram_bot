@@ -29,18 +29,21 @@ APP_ID = 1089
 # Trading symbols
 MARKETS = ["R_50", "R_75", "R_100"]
 
+# Expiry (minutes)
+DURATION_MIN = 3
+
 # Risk limits
-COOLDOWN_SEC = 60                  # seconds after a trade
+COOLDOWN_SEC = 60
 MAX_TRADES_PER_DAY = 30
-MAX_CONSEC_LOSSES = 5              # stop after 5 consecutive losses
+MAX_CONSEC_LOSSES = 5
 DAILY_PROFIT_TARGET = 10.0
 DAILY_LOSS_LIMIT = -8.0
-SECTION_PROFIT_TARGET = 3.0        # stop after +$3 in a section
+SECTION_PROFIT_TARGET = 3.0
 SECTIONS_PER_DAY = 1
 SECTION_LENGTH_SEC = 86400
 
 # Telegram (crypto bot token)
-TELEGRAM_TOKEN = "8487942336:AAGpnzUsKk_OvzgWdUZxDBg69tf_n5Hvivo"
+TELEGRAM_TOKEN = "8697638086:AAG00D0RXUAqXFTjy8-4XO4Bka2kBamo-VA"
 TELEGRAM_CHAT_ID = "7634818949"
 
 # Strategy timeframes
@@ -52,12 +55,12 @@ CANDLES_5M = 300
 CANDLES_15M = 300
 
 # Indicators
-EMA_TREND = 50                     # 15M EMA50
-EMA_PULLBACK = 20                  # 5M EMA20
+EMA_TREND = 50
+EMA_PULLBACK = 20
 ADX_PERIOD = 14
 ADX_MIN = 25.0
 ATR_PERIOD = 14
-PULLBACK_ATR_MULT = 0.5            # tighter
+PULLBACK_ATR_MULT = 0.5
 RSI_PERIOD = 14
 RSI_BUY_MIN = 45.0
 RSI_SELL_MAX = 55.0
@@ -67,7 +70,7 @@ MIN_BODY_RATIO = 0.55
 VOLUME_MULT = 1.2
 
 # Martingale
-PAYOUT_TARGET = 1.0                # base payout ($)
+PAYOUT_TARGET = 1.0
 MARTINGALE_MULT = 2.0
 MARTINGALE_MAX_STEPS = 3
 MAX_STAKE_ALLOWED = 16.0
@@ -79,7 +82,7 @@ RATE_LIMIT_BACKOFF_BASE = 20
 STATUS_REFRESH_COOLDOWN_SEC = 10
 
 # Session filter (optional – set to None for 24/7)
-ALLOWED_SESSIONS_UTC = None        # or {"LATE_NY"} etc.
+ALLOWED_SESSIONS_UTC = None
 
 # Logging
 TRADE_LOG_FILE = "trade_log.jsonl"
@@ -441,11 +444,11 @@ class DerivMultiTFBot:
             return False, f"Paused until 12:00am WAT ({left}s)"
 
         if self.total_profit_today >= DAILY_PROFIT_TARGET:
-            self.pause_until = (datetime.now(self.tz).replace(hour=0, minute=0, second=0) + timedelta(days=1)).timestamp()
+            self.pause_until = self._next_midnight_epoch()
             return False, f"Daily target reached (+${self.total_profit_today:.2f})"
 
         if self.total_profit_today <= DAILY_LOSS_LIMIT:
-            self.pause_until = (datetime.now(self.tz).replace(hour=0, minute=0, second=0) + timedelta(days=1)).timestamp()
+            self.pause_until = self._next_midnight_epoch()
             return False, f"Daily loss limit reached (-${DAILY_LOSS_LIMIT:.2f})"
 
         if self.consecutive_losses >= MAX_CONSEC_LOSSES:

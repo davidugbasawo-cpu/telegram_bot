@@ -1,11 +1,8 @@
 """
-Bitget Crypto Futures Bot – SMA 3/5 Crossover with 5‑Minute Trend Filter (1‑Minute)
-- BUY: SMA(close,3) crosses above SMA(open,5) AND 5m price > EMA20
-- SELL: SMA(close,3) crosses below SMA(open,5) AND 5m price < EMA20
-- Stop loss: recent swing low/high + ATR buffer (0.7× ATR)
-- Target: 2× risk (1:2)
-- Trailing stop: activate after 0.5% profit, trail 0.3%
-- Break‑even after 1R
+Bitget Crypto Futures Bot – 5‑Minute MACD with 1‑Hour Trend Filter (1:3 RR)
+- 1h EMA50 trend filter
+- 5m MACD(12,26,9) crossover in direction of 1h trend
+- 1:3 risk/reward, trailing stop, break‑even after 1R
 - Paper mode enabled
 """
 
@@ -39,50 +36,47 @@ PAPER_MODE  = True
 SYMBOLS = ["SOL/USDT:USDT", "BTC/USDT:USDT", "ADA/USDT:USDT"]
 
 # ========================= TIMEFRAMES =========================
-TF_1M = "1m"
-TF_5M = "5m"
-CANDLES_1M = 100
-CANDLES_5M = 50
+TF_ENTRY = "5m"
+TF_TREND = "1h"
+CANDLES_ENTRY = 150     # enough for MACD
+CANDLES_TREND = 100     # enough for EMA50
 
-# ========================= SMA STRATEGY =========================
-SMA_CLOSE_PERIOD = 3
-SMA_OPEN_PERIOD = 5
+# ========================= MACD SETTINGS =========================
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 
 # ========================= TREND FILTER =========================
-TREND_EMA_PERIOD = 20
+TREND_EMA_PERIOD = 50
 
 # ========================= RISK MANAGEMENT =========================
-STOP_ATR_MULT = 0.7          # slightly wider stop
-RR_RATIO = 2.0
+STOP_ATR_MULT = 0.7          # stop distance in ATR
+RR_RATIO = 3.0               # 1:3
 BASE_RISK_PER_TRADE = 0.25   # change to 1.0 for $1 risk
 
 # ========================= TRAILING STOP =========================
 TRAIL_ACTIVATION_PCT = 0.5
 TRAIL_DISTANCE_PCT = 0.3
 
-# ========================= SESSION =========================
+# ========================= SESSION (optional) =========================
 SESSION_START_UTC = 8
 SESSION_END_UTC   = 21
+USE_SESSION = True          # set False to trade 24/7
 
 # ========================= LIMITS =========================
-MAX_TRADES_PER_DAY   = 20
-MAX_CONSEC_LOSSES    = 5
+MAX_TRADES_PER_DAY   = 10
+MAX_CONSEC_LOSSES    = 3
 CONSEC_LOSS_PAUSE_HR = 24
 COOLDOWN_SEC         = 60
 MAX_OPEN_POSITIONS   = 3
 
 # ========================= OTHER =========================
-TRADE_LOG_FILE          = "sma_trend_trades.json"
+TRADE_LOG_FILE          = "macd_trend_trades.json"
 SCAN_INTERVAL_SEC       = 15
 STATUS_REFRESH_COOLDOWN = 10
 TIMEZONE                = "Africa/Lagos"
 
 # ========================= HELPERS =========================
-def sma(values, period):
-    if len(values) < period:
-        return None
-    return sum(values[-period:]) / period
-
 def ema_value(closes, period):
     closes = np.array(closes, dtype=float)
     if len(closes) < period:
@@ -92,6 +86,49 @@ def ema_value(closes, period):
     for c in closes[period:]:
         ema = c * k + ema * (1 - k)
     return float(ema)
+
+def macd(closes, fast, slow, signal):
+    if len(closes) < slow + signal:
+        return None, None, None
+    closes = np.array(closes, dtype=float)
+    ema_fast = ema_value(closes, fast)
+    ema_slow = ema_value(closes, slow)
+    if ema_fast is None or ema_slow is None:
+        return None, None, None
+    macd_line = ema_fast - ema_slow
+    # we need the whole series to compute signal line, so we'll use a simple rolling EMA for simplicity
+    # but for real accuracy we'd compute full series; for crossover detection we can just compute the last few values
+    # let's compute the last signal line value using a simplified approach: we'll compute macd_line for last few candles
+    # but to get a proper signal line we need a series. We'll do it properly:
+    # compute macd_line for all closes, then EMA of that.
+    if len(closes) < slow + signal + 10:
+        return None, None, None
+    # compute macd_line for all candles
+    macd_line_arr = []
+    for i in range(slow, len(closes)):
+        fast_ema = ema_value(closes[:i+1], fast)
+        slow_ema = ema_value(closes[:i+1], slow)
+        if fast_ema is None or slow_ema is None:
+            continue
+        macd_line_arr.append(fast_ema - slow_ema)
+    if len(macd_line_arr) < signal:
+        return None, None, None
+    # compute signal line as EMA of macd_line
+    signal_line_arr = []
+    k = 2.0 / (signal + 1)
+    # first value as average of first few macd_line values
+    start = signal
+    signal_val = sum(macd_line_arr[:start]) / start
+    signal_line_arr.append(signal_val)
+    for i in range(start, len(macd_line_arr)):
+        signal_val = macd_line_arr[i] * k + signal_val * (1 - k)
+        signal_line_arr.append(signal_val)
+    # last values
+    macd_current = macd_line_arr[-1]
+    macd_prev = macd_line_arr[-2] if len(macd_line_arr) > 1 else None
+    signal_current = signal_line_arr[-1]
+    signal_prev = signal_line_arr[-2] if len(signal_line_arr) > 1 else None
+    return macd_current, macd_prev, signal_current, signal_prev
 
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
@@ -108,6 +145,8 @@ def calculate_atr(candles, period=14):
     return sum(tr_values[-period:]) / period
 
 def is_session_active():
+    if not USE_SESSION:
+        return True
     utc_hour = datetime.utcnow().hour
     return SESSION_START_UTC <= utc_hour < SESSION_END_UTC
 
@@ -124,7 +163,7 @@ class Signal:
     reason:   str
     rr_ratio: float
 
-class SmaTrendBot:
+class MacdTrendBot:
     def __init__(self):
         self.exchange          = None
         self.app               = None
@@ -301,61 +340,83 @@ class SmaTrendBot:
         logger.error(f"OHLCV {symbol} {tf}: All attempts failed")
         return []
 
-    def build_signal(self, symbol, candles_1m, candles_5m):
-        """SMA 3/5 cross with 5‑minute EMA20 trend filter."""
+    def build_signal(self, symbol, candles_5m, candles_1h):
+        """MACD crossover on 5m with 1h EMA50 trend filter."""
         dbg = {}
-        if len(candles_1m) < max(SMA_CLOSE_PERIOD, SMA_OPEN_PERIOD) + 2:
-            return None, "Not enough 1m candles", dbg
-        if len(candles_5m) < TREND_EMA_PERIOD + 2:
+        if len(candles_5m) < MACD_SLOW + MACD_SIGNAL + 10:
             return None, "Not enough 5m candles", dbg
+        if len(candles_1h) < TREND_EMA_PERIOD + 2:
+            return None, "Not enough 1h candles", dbg
 
-        # ----- 5‑minute trend filter -----
+        # ----- 1h trend filter -----
+        closes_1h = [c[4] for c in candles_1h]
+        ema50_1h = ema_value(closes_1h, TREND_EMA_PERIOD)
+        if ema50_1h is None:
+            return None, "1h EMA not ready", dbg
+        current_price_1h = closes_1h[-1]
+        trend_up = current_price_1h > ema50_1h
+        trend_down = current_price_1h < ema50_1h
+        dbg["trend_1h"] = "UP" if trend_up else "DOWN" if trend_down else "SIDE"
+
+        # ----- 5m MACD -----
         closes_5m = [c[4] for c in candles_5m]
-        ema20_5m = ema_value(closes_5m, TREND_EMA_PERIOD)
-        if ema20_5m is None:
-            return None, "5m EMA not ready", dbg
-        current_price_5m = closes_5m[-1]
-        trend_up_5m = current_price_5m > ema20_5m
-        trend_down_5m = current_price_5m < ema20_5m
-        dbg["trend_5m"] = "UP" if trend_up_5m else "DOWN" if trend_down_5m else "SIDE"
+        # compute MACD properly (we need a full series for accurate signal line)
+        # let's compute macd_line and signal_line using the same logic as earlier
+        if len(closes_5m) < MACD_SLOW + MACD_SIGNAL + 10:
+            return None, "Not enough 5m data for MACD", dbg
 
-        # ----- 1‑minute SMA 3/5 cross -----
-        closes_1m = [c[4] for c in candles_1m]
-        opens_1m = [c[1] for c in candles_1m]
+        # compute ema_fast and ema_slow for all candles (rolling)
+        ema_fast_vals = []
+        ema_slow_vals = []
+        for i in range(MACD_SLOW, len(closes_5m)):
+            fast = ema_value(closes_5m[:i+1], MACD_FAST)
+            slow = ema_value(closes_5m[:i+1], MACD_SLOW)
+            if fast is None or slow is None:
+                continue
+            ema_fast_vals.append(fast)
+            ema_slow_vals.append(slow)
+        if len(ema_fast_vals) < MACD_SIGNAL + 1:
+            return None, "MACD not ready", dbg
 
-        sma_close_curr = sma(closes_1m, SMA_CLOSE_PERIOD)
-        sma_open_curr = sma(opens_1m, SMA_OPEN_PERIOD)
-        sma_close_prev = sma(closes_1m[:-1], SMA_CLOSE_PERIOD)
-        sma_open_prev = sma(opens_1m[:-1], SMA_OPEN_PERIOD)
+        macd_line = [fast - slow for fast, slow in zip(ema_fast_vals, ema_slow_vals)]
+        # signal line = EMA of macd_line
+        signal_line = []
+        k = 2.0 / (MACD_SIGNAL + 1)
+        sig = sum(macd_line[:MACD_SIGNAL]) / MACD_SIGNAL
+        signal_line.append(sig)
+        for val in macd_line[MACD_SIGNAL:]:
+            sig = val * k + sig * (1 - k)
+            signal_line.append(sig)
 
-        if None in [sma_close_curr, sma_open_curr, sma_close_prev, sma_open_prev]:
-            return None, "SMA not ready", dbg
+        # last two values
+        macd_curr = macd_line[-1]
+        macd_prev = macd_line[-2] if len(macd_line) > 1 else None
+        sig_curr = signal_line[-1]
+        sig_prev = signal_line[-2] if len(signal_line) > 1 else None
+        cross_up = macd_prev is not None and sig_prev is not None and macd_prev <= sig_prev and macd_curr > sig_curr
+        cross_down = macd_prev is not None and sig_prev is not None and macd_prev >= sig_prev and macd_curr < sig_curr
 
-        cross_up = sma_close_prev <= sma_open_prev and sma_close_curr > sma_open_curr
-        cross_down = sma_close_prev >= sma_open_prev and sma_close_curr < sma_open_curr
-
-        dbg["sma_close"] = round(sma_close_curr, 5)
-        dbg["sma_open"] = round(sma_open_curr, 5)
+        dbg["macd"] = f"{macd_curr:.2f}/{sig_curr:.2f}"
         dbg["cross_up"] = cross_up
         dbg["cross_down"] = cross_down
 
-        # Use the last closed 1m candle as entry candle
-        conf_candle = candles_1m[-1]
+        # Use the last closed 5m candle as entry candle
+        conf_candle = candles_5m[-1]
         entry_price = conf_candle[4]
 
         # ATR for stop
-        atr = calculate_atr(candles_1m, 14)
+        atr = calculate_atr(candles_5m, 14)
         if atr is None:
             return None, "ATR not ready", dbg
 
-        # Recent swing levels (last 5 candles excluding the current forming)
-        recent_lows = [c[3] for c in candles_1m[-6:-1]]
-        recent_highs = [c[2] for c in candles_1m[-6:-1]]
+        # Recent swing levels (last 10 candles on 5m)
+        recent_lows = [c[3] for c in candles_5m[-12:-1]]
+        recent_highs = [c[2] for c in candles_5m[-12:-1]]
         swing_low = min(recent_lows) if recent_lows else entry_price
         swing_high = max(recent_highs) if recent_highs else entry_price
 
-        # BUY: cross up AND 5m trend up
-        if cross_up and trend_up_5m:
+        # BUY: MACD cross up AND 1h trend up
+        if cross_up and trend_up:
             stop = swing_low - (atr * STOP_ATR_MULT)
             if entry_price - stop < entry_price * 0.0015:
                 stop = entry_price - (entry_price * 0.0015)
@@ -365,12 +426,12 @@ class SmaTrendBot:
             target = entry_price + risk * RR_RATIO
             return Signal(
                 "buy", symbol, entry_price, stop, target,
-                f"SMA 3/5 cross UP & 5m trend UP | sma3={sma_close_curr:.5f} sma5={sma_open_curr:.5f}",
+                f"MACD cross up (5m) & 1h trend up",
                 RR_RATIO
             ), f"LONG ✅ (1:{RR_RATIO:.0f})", dbg
 
-        # SELL: cross down AND 5m trend down
-        if cross_down and trend_down_5m:
+        # SELL: MACD cross down AND 1h trend down
+        if cross_down and trend_down:
             stop = swing_high + (atr * STOP_ATR_MULT)
             if stop - entry_price < entry_price * 0.0015:
                 stop = entry_price + (entry_price * 0.0015)
@@ -380,11 +441,11 @@ class SmaTrendBot:
             target = entry_price - risk * RR_RATIO
             return Signal(
                 "sell", symbol, entry_price, stop, target,
-                f"SMA 3/5 cross DOWN & 5m trend DOWN | sma3={sma_close_curr:.5f} sma5={sma_open_curr:.5f}",
+                f"MACD cross down (5m) & 1h trend down",
                 RR_RATIO
             ), f"SHORT ✅ (1:{RR_RATIO:.0f})", dbg
 
-        return None, f"SMA3:{sma_close_curr:.5f} SMA5:{sma_open_curr:.5f} – no aligned signal", dbg
+        return None, f"MACD {dbg.get('macd','n/a')} – no aligned signal", dbg
 
     async def set_leverage(self, symbol):
         try:
@@ -495,7 +556,7 @@ class SmaTrendBot:
         for sym in list(self.paper_positions.keys()):
             try:
                 pos = self.paper_positions[sym]
-                candles = await self.fetch_ohlcv(sym, TF_1M, 4)
+                candles = await self.fetch_ohlcv(sym, TF_ENTRY, 4)
                 if not candles or len(candles) < 2:
                     continue
                 last = candles[-1]
@@ -646,23 +707,23 @@ class SmaTrendBot:
                     self.market_debug[symbol] = {"time": time.time(), "why": gate, "signal": None}
                     continue
 
-                # Fetch 1m and 5m candles
-                c1 = await self.fetch_ohlcv(symbol, TF_1M, CANDLES_1M)
+                # Fetch 5m and 1h candles
+                c5 = await self.fetch_ohlcv(symbol, TF_ENTRY, CANDLES_ENTRY)
                 await asyncio.sleep(0.2)
-                c5 = await self.fetch_ohlcv(symbol, TF_5M, CANDLES_5M)
-                if not c1 or not c5:
+                c1h = await self.fetch_ohlcv(symbol, TF_TREND, CANDLES_TREND)
+                if not c5 or not c1h:
                     self.market_debug[symbol] = {"time": time.time(), "why": "No candles", "signal": None}
                     await asyncio.sleep(10)
                     continue
 
-                signal, reason, dbg = self.build_signal(symbol, c1, c5)
+                signal, reason, dbg = self.build_signal(symbol, c5, c1h)
                 dbg["time"] = time.time()
                 dbg["why"] = reason
                 dbg["signal"] = signal.side.upper() if signal else None
                 self.market_debug[symbol] = dbg
 
                 if signal:
-                    entry_candle_ts = c1[-1][0]
+                    entry_candle_ts = c5[-1][0]
                     await self.place_trade(signal, entry_candle_ts)
 
             except Exception as e:
@@ -685,7 +746,7 @@ class SmaTrendBot:
             await asyncio.sleep(60)
 
 # ========================= TELEGRAM UI =========================
-bot = SmaTrendBot()
+bot = MacdTrendBot()
 
 def keyboard():
     return InlineKeyboardMarkup([
@@ -741,14 +802,14 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(bot.scan_symbol(sym, stagger=i*12))
         mode = "PAPER" if PAPER_MODE else "LIVE"
         await safe_edit(q,
-            f"🔍 SMA 3/5 CROSSOVER + 5m TREND FILTER (1‑Minute, 1:2 RR)\n"
+            f"🔍 MACD + 1h TREND BOT (5m, 1:3 RR)\n"
             f"Mode: {mode}\nPairs: SOL | BTC | ADA\n"
             f"Strategy:\n"
-            f"  📈 BUY: SMA3(close) crosses above SMA5(open) AND 5m price > EMA20\n"
-            f"  📉 SELL: SMA3(close) crosses below SMA5(open) AND 5m price < EMA20\n"
-            f"  🎯 1:2 RR, trailing stop, break‑even after 1R\n"
-            f"  🔒 Stop widened to 0.7× ATR\n"
-            f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
+            f"  📈 1h EMA50 trend filter\n"
+            f"  📊 5m MACD(12,26,9) crossover\n"
+            f"  🎯 Only trade in direction of 1h trend\n"
+            f"  💰 1:3 risk/reward, trailing stop, break‑even after 1R\n"
+            f"Session: {'24/7' if not USE_SESSION else f'{SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC'}\n"
             f"Stop after {MAX_CONSEC_LOSSES} consecutive losses", keyboard())
     elif q.data == "STOP":
         bot.is_scanning = False
@@ -835,15 +896,15 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot._chat_ids.add(update.message.chat_id)
     mode = "PAPER" if PAPER_MODE else "LIVE"
     await update.message.reply_text(
-        "💎 SMA 3/5 Crossover + 5m Trend Bot\n"
+        "💎 MACD + 1h Trend Bot (5m, 1:3 RR)\n"
         f"Mode: {mode}\n\n"
         "**STRATEGY:**\n"
-        "📈 BUY: SMA3(close) crosses above SMA5(open) AND 5m price > EMA20\n"
-        "📉 SELL: SMA3(close) crosses below SMA5(open) AND 5m price < EMA20\n"
-        "🎯 1:2 RR, trailing stop, break‑even after 1R\n"
-        "🔒 Stop widened to 0.7× ATR\n\n"
+        "📈 1h EMA50 defines trend\n"
+        "📊 5m MACD(12,26,9) crossover\n"
+        "🎯 Trade only in direction of 1h trend\n"
+        "💰 1:3 risk/reward, trailing stop, break‑even after 1R\n\n"
         f"**RISK:** Stop after {MAX_CONSEC_LOSSES} losses, max {MAX_OPEN_POSITIONS} positions\n"
-        f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n\n"
+        f"Session: {'24/7' if not USE_SESSION else f'{SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC'}\n\n"
         "**USE:** CONNECT → START → STATUS",
         reply_markup=keyboard()
     )

@@ -1,8 +1,8 @@
 """
-Bitget Crypto Futures Bot – SMA 3/5 Crossover (1‑Minute, 1:2 RR, Trailing Stop)
-- SMA of close (3) crosses above SMA of open (5) → BUY
-- SMA of close (3) crosses below SMA of open (5) → SELL
-- Stop loss: recent swing low/high + ATR buffer
+Bitget Crypto Futures Bot – SMA 3/5 Crossover with 5‑Minute Trend Filter (1‑Minute)
+- BUY: SMA(close,3) crosses above SMA(open,5) AND 5m price > EMA20
+- SELL: SMA(close,3) crosses below SMA(open,5) AND 5m price < EMA20
+- Stop loss: recent swing low/high + ATR buffer (0.7× ATR)
 - Target: 2× risk (1:2)
 - Trailing stop: activate after 0.5% profit, trail 0.3%
 - Break‑even after 1R
@@ -39,16 +39,21 @@ PAPER_MODE  = True
 SYMBOLS = ["SOL/USDT:USDT", "BTC/USDT:USDT", "ADA/USDT:USDT"]
 
 # ========================= TIMEFRAMES =========================
-TF_ENTRY = "1m"
-CANDLES = 100        # enough for SMA calculations and ATR
+TF_1M = "1m"
+TF_5M = "5m"
+CANDLES_1M = 100
+CANDLES_5M = 50
 
 # ========================= SMA STRATEGY =========================
 SMA_CLOSE_PERIOD = 3
 SMA_OPEN_PERIOD = 5
 
+# ========================= TREND FILTER =========================
+TREND_EMA_PERIOD = 20
+
 # ========================= RISK MANAGEMENT =========================
-STOP_ATR_MULT = 0.5          # stop distance in ATR
-RR_RATIO = 2.0               # 1:2
+STOP_ATR_MULT = 0.7          # slightly wider stop
+RR_RATIO = 2.0
 BASE_RISK_PER_TRADE = 0.25   # change to 1.0 for $1 risk
 
 # ========================= TRAILING STOP =========================
@@ -67,17 +72,26 @@ COOLDOWN_SEC         = 60
 MAX_OPEN_POSITIONS   = 3
 
 # ========================= OTHER =========================
-TRADE_LOG_FILE          = "sma_cross_trades.json"
+TRADE_LOG_FILE          = "sma_trend_trades.json"
 SCAN_INTERVAL_SEC       = 15
 STATUS_REFRESH_COOLDOWN = 10
 TIMEZONE                = "Africa/Lagos"
 
 # ========================= HELPERS =========================
 def sma(values, period):
-    """Simple moving average of a list of numbers."""
     if len(values) < period:
         return None
     return sum(values[-period:]) / period
+
+def ema_value(closes, period):
+    closes = np.array(closes, dtype=float)
+    if len(closes) < period:
+        return None
+    k = 2.0 / (period + 1)
+    ema = float(np.mean(closes[:period]))
+    for c in closes[period:]:
+        ema = c * k + ema * (1 - k)
+    return float(ema)
 
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
@@ -110,8 +124,7 @@ class Signal:
     reason:   str
     rr_ratio: float
 
-# ========================= BOT =========================
-class SmaCrossBot:
+class SmaTrendBot:
     def __init__(self):
         self.exchange          = None
         self.app               = None
@@ -288,30 +301,36 @@ class SmaCrossBot:
         logger.error(f"OHLCV {symbol} {tf}: All attempts failed")
         return []
 
-    def build_signal(self, symbol, candles):
-        """
-        SMA 3/5 Crossover Strategy.
-        BUY: SMA(close, 3) crosses ABOVE SMA(open, 5)
-        SELL: SMA(close, 3) crosses BELOW SMA(open, 5)
-        """
+    def build_signal(self, symbol, candles_1m, candles_5m):
+        """SMA 3/5 cross with 5‑minute EMA20 trend filter."""
         dbg = {}
-        if len(candles) < max(SMA_CLOSE_PERIOD, SMA_OPEN_PERIOD) + 2:
-            return None, "Not enough candles", dbg
+        if len(candles_1m) < max(SMA_CLOSE_PERIOD, SMA_OPEN_PERIOD) + 2:
+            return None, "Not enough 1m candles", dbg
+        if len(candles_5m) < TREND_EMA_PERIOD + 2:
+            return None, "Not enough 5m candles", dbg
 
-        # Prepare lists of closes and opens
-        closes = [c[4] for c in candles]
-        opens = [c[1] for c in candles]
+        # ----- 5‑minute trend filter -----
+        closes_5m = [c[4] for c in candles_5m]
+        ema20_5m = ema_value(closes_5m, TREND_EMA_PERIOD)
+        if ema20_5m is None:
+            return None, "5m EMA not ready", dbg
+        current_price_5m = closes_5m[-1]
+        trend_up_5m = current_price_5m > ema20_5m
+        trend_down_5m = current_price_5m < ema20_5m
+        dbg["trend_5m"] = "UP" if trend_up_5m else "DOWN" if trend_down_5m else "SIDE"
 
-        # Current and previous SMA values
-        sma_close_curr = sma(closes, SMA_CLOSE_PERIOD)
-        sma_open_curr = sma(opens, SMA_OPEN_PERIOD)
-        sma_close_prev = sma(closes[:-1], SMA_CLOSE_PERIOD)
-        sma_open_prev = sma(opens[:-1], SMA_OPEN_PERIOD)
+        # ----- 1‑minute SMA 3/5 cross -----
+        closes_1m = [c[4] for c in candles_1m]
+        opens_1m = [c[1] for c in candles_1m]
+
+        sma_close_curr = sma(closes_1m, SMA_CLOSE_PERIOD)
+        sma_open_curr = sma(opens_1m, SMA_OPEN_PERIOD)
+        sma_close_prev = sma(closes_1m[:-1], SMA_CLOSE_PERIOD)
+        sma_open_prev = sma(opens_1m[:-1], SMA_OPEN_PERIOD)
 
         if None in [sma_close_curr, sma_open_curr, sma_close_prev, sma_open_prev]:
-            return None, "SMA values not ready", dbg
+            return None, "SMA not ready", dbg
 
-        # Crossover detection
         cross_up = sma_close_prev <= sma_open_prev and sma_close_curr > sma_open_curr
         cross_down = sma_close_prev >= sma_open_prev and sma_close_curr < sma_open_curr
 
@@ -320,23 +339,23 @@ class SmaCrossBot:
         dbg["cross_up"] = cross_up
         dbg["cross_down"] = cross_down
 
-        # Use the last closed candle as confirmation (candles[-1])
-        conf_candle = candles[-1]
-        entry_price = conf_candle[4]  # close price
+        # Use the last closed 1m candle as entry candle
+        conf_candle = candles_1m[-1]
+        entry_price = conf_candle[4]
 
-        # ATR for stop distance
-        atr = calculate_atr(candles, 14)
+        # ATR for stop
+        atr = calculate_atr(candles_1m, 14)
         if atr is None:
             return None, "ATR not ready", dbg
 
-        # Recent swing levels (last 5 candles excluding the current forming one)
-        recent_lows = [c[3] for c in candles[-6:-1]]
-        recent_highs = [c[2] for c in candles[-6:-1]]
+        # Recent swing levels (last 5 candles excluding the current forming)
+        recent_lows = [c[3] for c in candles_1m[-6:-1]]
+        recent_highs = [c[2] for c in candles_1m[-6:-1]]
         swing_low = min(recent_lows) if recent_lows else entry_price
         swing_high = max(recent_highs) if recent_highs else entry_price
 
-        if cross_up:
-            # BUY signal
+        # BUY: cross up AND 5m trend up
+        if cross_up and trend_up_5m:
             stop = swing_low - (atr * STOP_ATR_MULT)
             if entry_price - stop < entry_price * 0.0015:
                 stop = entry_price - (entry_price * 0.0015)
@@ -346,12 +365,12 @@ class SmaCrossBot:
             target = entry_price + risk * RR_RATIO
             return Signal(
                 "buy", symbol, entry_price, stop, target,
-                f"SMA 3/5 cross UP | close={sma_close_curr:.5f} open={sma_open_curr:.5f}",
+                f"SMA 3/5 cross UP & 5m trend UP | sma3={sma_close_curr:.5f} sma5={sma_open_curr:.5f}",
                 RR_RATIO
             ), f"LONG ✅ (1:{RR_RATIO:.0f})", dbg
 
-        if cross_down:
-            # SELL signal
+        # SELL: cross down AND 5m trend down
+        if cross_down and trend_down_5m:
             stop = swing_high + (atr * STOP_ATR_MULT)
             if stop - entry_price < entry_price * 0.0015:
                 stop = entry_price + (entry_price * 0.0015)
@@ -361,11 +380,11 @@ class SmaCrossBot:
             target = entry_price - risk * RR_RATIO
             return Signal(
                 "sell", symbol, entry_price, stop, target,
-                f"SMA 3/5 cross DOWN | close={sma_close_curr:.5f} open={sma_open_curr:.5f}",
+                f"SMA 3/5 cross DOWN & 5m trend DOWN | sma3={sma_close_curr:.5f} sma5={sma_open_curr:.5f}",
                 RR_RATIO
             ), f"SHORT ✅ (1:{RR_RATIO:.0f})", dbg
 
-        return None, f"SMA3:{sma_close_curr:.5f} SMA5:{sma_open_curr:.5f} – no cross", dbg
+        return None, f"SMA3:{sma_close_curr:.5f} SMA5:{sma_open_curr:.5f} – no aligned signal", dbg
 
     async def set_leverage(self, symbol):
         try:
@@ -476,7 +495,7 @@ class SmaCrossBot:
         for sym in list(self.paper_positions.keys()):
             try:
                 pos = self.paper_positions[sym]
-                candles = await self.fetch_ohlcv(sym, TF_ENTRY, 4)
+                candles = await self.fetch_ohlcv(sym, TF_1M, 4)
                 if not candles or len(candles) < 2:
                     continue
                 last = candles[-1]
@@ -494,7 +513,6 @@ class SmaCrossBot:
                 rr_ratio = pos.get("rr_ratio", RR_RATIO)
                 risk_amount = BASE_RISK_PER_TRADE
 
-                # Update highest/lowest for trailing
                 if side == "buy":
                     highest = pos.get("highest_price", entry)
                     if current_price > highest:
@@ -502,7 +520,6 @@ class SmaCrossBot:
                         pos["highest_price"] = highest
                     profit_pct = (highest - entry) / entry * 100
 
-                    # Break-even after 1R
                     if not pos.get("breakeven_activated", False):
                         risk_pct = (entry - stop) / entry * 100
                         if profit_pct >= risk_pct:
@@ -510,7 +527,6 @@ class SmaCrossBot:
                             pos["stop"] = new_stop
                             pos["breakeven_activated"] = True
                             await self.tg(f"🔒 {sym.replace('/USDT:USDT','')} BE → stop moved to entry")
-                    # Trailing stop
                     if profit_pct >= TRAIL_ACTIVATION_PCT:
                         trail_stop = highest * (1 - TRAIL_DISTANCE_PCT / 100)
                         if trail_stop > stop:
@@ -536,7 +552,6 @@ class SmaCrossBot:
                             pos["stop"] = trail_stop
 
                 new_stop = pos["stop"]
-                # Check stop/target
                 result = None
                 pnl = 0.0
                 if side == "buy":
@@ -605,7 +620,6 @@ class SmaCrossBot:
         ))
 
     async def reconcile_live_positions(self):
-        # Placeholder for live – same logic would apply
         pass
 
     async def reconcile(self):
@@ -632,14 +646,16 @@ class SmaCrossBot:
                     self.market_debug[symbol] = {"time": time.time(), "why": gate, "signal": None}
                     continue
 
-                # Fetch 1m candles
-                c1 = await self.fetch_ohlcv(symbol, TF_ENTRY, CANDLES)
-                if not c1:
+                # Fetch 1m and 5m candles
+                c1 = await self.fetch_ohlcv(symbol, TF_1M, CANDLES_1M)
+                await asyncio.sleep(0.2)
+                c5 = await self.fetch_ohlcv(symbol, TF_5M, CANDLES_5M)
+                if not c1 or not c5:
                     self.market_debug[symbol] = {"time": time.time(), "why": "No candles", "signal": None}
                     await asyncio.sleep(10)
                     continue
 
-                signal, reason, dbg = self.build_signal(symbol, c1)
+                signal, reason, dbg = self.build_signal(symbol, c1, c5)
                 dbg["time"] = time.time()
                 dbg["why"] = reason
                 dbg["signal"] = signal.side.upper() if signal else None
@@ -669,7 +685,7 @@ class SmaCrossBot:
             await asyncio.sleep(60)
 
 # ========================= TELEGRAM UI =========================
-bot = SmaCrossBot()
+bot = SmaTrendBot()
 
 def keyboard():
     return InlineKeyboardMarkup([
@@ -725,12 +741,13 @@ async def btn_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(bot.scan_symbol(sym, stagger=i*12))
         mode = "PAPER" if PAPER_MODE else "LIVE"
         await safe_edit(q,
-            f"🔍 SMA 3/5 CROSSOVER SCANNER (1‑Minute, 1:2 RR)\n"
+            f"🔍 SMA 3/5 CROSSOVER + 5m TREND FILTER (1‑Minute, 1:2 RR)\n"
             f"Mode: {mode}\nPairs: SOL | BTC | ADA\n"
             f"Strategy:\n"
-            f"  📈 BUY when SMA(close,3) crosses ABOVE SMA(open,5)\n"
-            f"  📉 SELL when SMA(close,3) crosses BELOW SMA(open,5)\n"
+            f"  📈 BUY: SMA3(close) crosses above SMA5(open) AND 5m price > EMA20\n"
+            f"  📉 SELL: SMA3(close) crosses below SMA5(open) AND 5m price < EMA20\n"
             f"  🎯 1:2 RR, trailing stop, break‑even after 1R\n"
+            f"  🔒 Stop widened to 0.7× ATR\n"
             f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n"
             f"Stop after {MAX_CONSEC_LOSSES} consecutive losses", keyboard())
     elif q.data == "STOP":
@@ -818,12 +835,13 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot._chat_ids.add(update.message.chat_id)
     mode = "PAPER" if PAPER_MODE else "LIVE"
     await update.message.reply_text(
-        "💎 SMA 3/5 Crossover Bot (1‑Minute, 1:2 RR)\n"
+        "💎 SMA 3/5 Crossover + 5m Trend Bot\n"
         f"Mode: {mode}\n\n"
         "**STRATEGY:**\n"
-        "📈 BUY when SMA(close,3) crosses ABOVE SMA(open,5)\n"
-        "📉 SELL when SMA(close,3) crosses BELOW SMA(open,5)\n"
-        "🎯 1:2 risk/reward, trailing stop, break‑even after 1R\n\n"
+        "📈 BUY: SMA3(close) crosses above SMA5(open) AND 5m price > EMA20\n"
+        "📉 SELL: SMA3(close) crosses below SMA5(open) AND 5m price < EMA20\n"
+        "🎯 1:2 RR, trailing stop, break‑even after 1R\n"
+        "🔒 Stop widened to 0.7× ATR\n\n"
         f"**RISK:** Stop after {MAX_CONSEC_LOSSES} losses, max {MAX_OPEN_POSITIONS} positions\n"
         f"Session: {SESSION_START_UTC:02d}:00–{SESSION_END_UTC:02d}:00 UTC\n\n"
         "**USE:** CONNECT → START → STATUS",

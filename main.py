@@ -1,12 +1,6 @@
-"""
-Deriv Multi-Timeframe Bot – 15M EMA50 trend + 5M EMA20 pullback + 1M entry
-- Fetches 15M, 5M, 1M candles
-- Uses EMA50 on 15M for trend
-- Uses EMA20 on 5M for pullback, with ATR zone and rejection candle
-- 1M confirmation: strong candle (body ≥ 50%) + volume spike (optional) + RSI >50 (CALL) or <50 (PUT)
-- Martingale, sections, daily limits unchanged
-- Paper mode (DEMO) enabled by default
-"""
+# ⚠️ SECURITY NOTE:
+# Do NOT post your Deriv / Telegram tokens publicly.
+# Paste them only on your local machine.
 
 import asyncio
 import logging
@@ -25,14 +19,13 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
 
-# Synthetic indices – you can add more, but start with these
-MARKETS = ["R_75", "R_100"]
+MARKETS = ["R_10", "R_25"]  # add more if you want
 
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
 MAX_CONSEC_LOSSES = 10
 
-# Telegram token from crypto bot (already yours)
+# ✅ Telegram token updated to your crypto bot token
 TELEGRAM_TOKEN = "8697638086:AAG00D0RXUAqXFTjy8-4XO4Bka2kBamo-VA"
 TELEGRAM_CHAT_ID = "7634818949"
 
@@ -40,58 +33,69 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ========================= STRATEGY SETTINGS =========================
-DURATION_MIN = 2  # 2-minute expiry
+TF_SEC = 60  # M1 candles
+CANDLES_COUNT = 120
 
-# Timeframes (in seconds)
-TF_15M = 15 * 60
-TF_5M = 5 * 60
-TF_1M = 60
+RSI_PERIOD = 14
+DURATION_MIN = 2  # ✅ 2-minute expiry
 
-CANDLES_15M = 150   # more than enough for EMA50
-CANDLES_5M = 150
-CANDLES_1M = 150
+# ========================= STRATEGY 2 SETTINGS (BINARY) =========================
+EMA_TREND_PERIOD = 200
+EMA_PULLBACK_PERIOD = 50
 
-# EMA periods
-EMA_TREND_PERIOD = 50     # 15M EMA50
-EMA_PULLBACK_PERIOD = 20  # 5M EMA20
+RSI_CALL_MIN = 55.0   # ✅ Strategy 2: stricter RSI for binaries
+RSI_PUT_MAX = 45.0
 
-# Pullback zone multiplier (ATR)
-PULLBACK_ATR_MULT = 0.75
+STOCH_K_PERIOD = 5
+STOCH_D_PERIOD = 3
+STOCH_SMOOTH = 3
+STOCH_OVERSOLD = 20.0
+STOCH_OVERBOUGHT = 80.0
 
-# Rejection candle threshold (percentage of candle range)
-REJECTION_WICK_MIN = 0.3
-REJECTION_CLOSE_MOVE = 0.2   # close must be this fraction of range away from wick
-
-# Entry confirmation
-MIN_BODY_RATIO = 0.50
-VOLUME_MULT = 1.2
-RSI_PERIOD = 7
-
-# ADX filter – optional (set to False to disable)
-USE_ADX = False
-ADX_PERIOD = 14
-ADX_MIN = 25.0
-
-# ========================= RISK MANAGEMENT =========================
+# ========================= EMA50 SLOPE + DAILY TARGET =========================
+EMA_SLOPE_LOOKBACK = 10
+EMA_SLOPE_MIN = 0.2
 DAILY_PROFIT_TARGET = 2.0
+
+# ========================= SECTIONS =========================
+SECTIONS_PER_DAY = 4
 SECTION_PROFIT_TARGET = 1
+SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
+
+# ========================= PAYOUT MODE =========================
+USE_PAYOUT_MODE = True
+PAYOUT_TARGET = 1
+MIN_PAYOUT = 0.35
 MAX_STAKE_ALLOWED = 10.00
+
+# ========================= MARTINGALE SETTINGS =========================
 MARTINGALE_MULT = 1.8
 MARTINGALE_MAX_STEPS = 4
 MARTINGALE_MAX_STAKE = 16.0
 
-# ========================= SECTIONS =========================
-SECTIONS_PER_DAY = 4
-SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
+# ========================= CANDLE STRENGTH FILTER =========================
+MIN_BODY_RATIO = 0.45
+MIN_CANDLE_RANGE = 1e-6
 
 # ========================= ANTI RATE-LIMIT =========================
-TICKS_GLOBAL_MIN_INTERVAL = 0.35
-RATE_LIMIT_BACKOFF_BASE = 20
+TICKS_GLOBAL_MIN_INTERVAL = 0.35  # seconds between ANY ticks_history calls
+RATE_LIMIT_BACKOFF_BASE = 20      # seconds (will grow if rate limit repeats)
+
+# ========================= UI: REFRESH COOLDOWN =========================
 STATUS_REFRESH_COOLDOWN_SEC = 10
 
-# ========================= INDICATOR HELPERS =========================
-def ema(values, period):
-    """Exponential moving average."""
+# ========================= ADX + ATR FILTERS (NEW) =========================
+ADX_PERIOD = 14
+ATR_PERIOD = 14
+
+ADX_MIN = 25.0       # trend strength threshold
+ATR_MIN = 0.0        # 0.0 = show ATR but don't block trades by ATR
+
+TREND_FILTER_MODE = "BOTH"  # "BOTH" requires ADX✅ and ATR✅, "EITHER" allows ADX✅ OR ATR✅
+
+
+# ========================= INDICATOR MATH =========================
+def calculate_ema(values, period: int):
     values = np.array(values, dtype=float)
     if len(values) < period:
         return np.array([])
@@ -99,115 +103,173 @@ def ema(values, period):
     ema = np.zeros_like(values)
     ema[0] = values[0]
     for i in range(1, len(values)):
-        ema[i] = values[i] * k + ema[i-1] * (1 - k)
+        ema[i] = values[i] * k + ema[i - 1] * (1 - k)
     return ema
 
-def rsi(values, period=14):
-    """Relative Strength Index."""
+
+def calculate_rsi(values, period=14):
     values = np.array(values, dtype=float)
     n = len(values)
     if n < period + 2:
         return np.array([])
+
     deltas = np.diff(values)
     gains = np.where(deltas > 0, deltas, 0.0)
     losses = np.where(deltas < 0, -deltas, 0.0)
+
+    rsi = np.full(n, np.nan, dtype=float)
+
     avg_gain = np.mean(gains[:period])
     avg_loss = np.mean(losses[:period])
     rs = avg_gain / (avg_loss + 1e-12)
-    rsi_arr = np.full(n, np.nan, dtype=float)
-    rsi_arr[period] = 100.0 - (100.0 / (1.0 + rs))
-    for i in range(period+1, n):
-        gain = gains[i-1]
-        loss = losses[i-1]
-        avg_gain = (avg_gain * (period-1) + gain) / period
-        avg_loss = (avg_loss * (period-1) + loss) / period
-        rs = avg_gain / (avg_loss + 1e-12)
-        rsi_arr[i] = 100.0 - (100.0 / (1.0 + rs))
-    return rsi_arr
+    rsi[period] = 100.0 - (100.0 / (1.0 + rs))
 
-def atr(highs, lows, closes, period=14):
-    """Average True Range."""
+    for i in range(period + 1, n):
+        gain = gains[i - 1]
+        loss = losses[i - 1]
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        rs = avg_gain / (avg_loss + 1e-12)
+        rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+
+    return rsi
+
+
+def calculate_stochastic(highs, lows, closes, k_period=5, d_period=3, smooth=3):
+    highs = np.array(highs, dtype=float)
+    lows = np.array(lows, dtype=float)
+    closes = np.array(closes, dtype=float)
+
     n = len(closes)
-    if n < period + 1:
+    if n < k_period + smooth + d_period + 5:
+        return np.array([]), np.array([])
+
+    k_raw = np.full(n, np.nan, dtype=float)
+
+    for i in range(k_period - 1, n):
+        hh = np.max(highs[i - k_period + 1:i + 1])
+        ll = np.min(lows[i - k_period + 1:i + 1])
+        denom = (hh - ll) + 1e-12
+        k_raw[i] = 100.0 * ((closes[i] - ll) / denom)
+
+    # smooth %K
+    k_smooth = np.full(n, np.nan, dtype=float)
+    for i in range((k_period - 1) + (smooth - 1), n):
+        k_smooth[i] = np.nanmean(k_raw[i - smooth + 1:i + 1])
+
+    # %D = SMA of smoothed %K
+    d_line = np.full(n, np.nan, dtype=float)
+    for i in range((k_period - 1) + (smooth - 1) + (d_period - 1), n):
+        d_line[i] = np.nanmean(k_smooth[i - d_period + 1:i + 1])
+
+    return k_smooth, d_line
+
+
+def calculate_atr(highs, lows, closes, period=14):
+    highs = np.array(highs, dtype=float)
+    lows = np.array(lows, dtype=float)
+    closes = np.array(closes, dtype=float)
+
+    n = len(closes)
+    if n < period + 2:
         return np.array([])
+
     prev_close = np.roll(closes, 1)
     prev_close[0] = closes[0]
-    tr = np.maximum(highs - lows,
-                    np.maximum(np.abs(highs - prev_close),
-                               np.abs(lows - prev_close)))
-    atr_arr = np.full(n, np.nan, dtype=float)
-    atr_arr[period] = np.mean(tr[1:period+1])
-    for i in range(period+1, n):
-        atr_arr[i] = (atr_arr[i-1] * (period-1) + tr[i]) / period
-    return atr_arr
 
-def adx(highs, lows, closes, period=14):
-    """Average Directional Index."""
+    tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_close), np.abs(lows - prev_close)))
+
+    atr = np.full(n, np.nan, dtype=float)
+    atr[period] = np.mean(tr[1:period + 1])
+    for i in range(period + 1, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+
+    return atr
+
+
+def calculate_adx(highs, lows, closes, period=14):
+    highs = np.array(highs, dtype=float)
+    lows = np.array(lows, dtype=float)
+    closes = np.array(closes, dtype=float)
+
     n = len(closes)
     if n < period * 2 + 2:
         return np.array([])
+
     up_move = highs[1:] - highs[:-1]
     down_move = lows[:-1] - lows[1:]
+
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
     prev_close = closes[:-1]
-    tr = np.maximum(highs[1:] - lows[1:],
-                    np.maximum(np.abs(highs[1:] - prev_close),
-                               np.abs(lows[1:] - prev_close)))
+    tr = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - prev_close), np.abs(lows[1:] - prev_close)))
+
     tr_s = np.zeros_like(tr)
     plus_s = np.zeros_like(plus_dm)
     minus_s = np.zeros_like(minus_dm)
-    tr_s[period-1] = np.sum(tr[:period])
-    plus_s[period-1] = np.sum(plus_dm[:period])
-    minus_s[period-1] = np.sum(minus_dm[:period])
+
+    tr_s[period - 1] = np.sum(tr[:period])
+    plus_s[period - 1] = np.sum(plus_dm[:period])
+    minus_s[period - 1] = np.sum(minus_dm[:period])
+
     for i in range(period, len(tr)):
-        tr_s[i] = tr_s[i-1] - (tr_s[i-1]/period) + tr[i]
-        plus_s[i] = plus_s[i-1] - (plus_s[i-1]/period) + plus_dm[i]
-        minus_s[i] = minus_s[i-1] - (minus_s[i-1]/period) + minus_dm[i]
+        tr_s[i] = tr_s[i - 1] - (tr_s[i - 1] / period) + tr[i]
+        plus_s[i] = plus_s[i - 1] - (plus_s[i - 1] / period) + plus_dm[i]
+        minus_s[i] = minus_s[i - 1] - (minus_s[i - 1] / period) + minus_dm[i]
+
     plus_di = 100.0 * (plus_s / (tr_s + 1e-12))
     minus_di = 100.0 * (minus_s / (tr_s + 1e-12))
     dx = 100.0 * (np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12))
-    adx_arr = np.full(n, np.nan, dtype=float)
+
+    adx = np.full(n, np.nan, dtype=float)
     dx_full = np.full(n, np.nan, dtype=float)
     dx_full[1:] = dx
-    start = period * 2
-    adx_arr[start] = np.nanmean(dx_full[period:start+1])
-    for i in range(start+1, n):
-        adx_arr[i] = ((adx_arr[i-1] * (period-1)) + dx_full[i]) / period
-    return adx_arr
 
-def build_candles(data):
-    """Convert ticks_history candles to list of dicts with optional volume."""
+    start = period * 2
+    adx[start] = np.nanmean(dx_full[period:start + 1])
+    for i in range(start + 1, n):
+        adx[i] = ((adx[i - 1] * (period - 1)) + dx_full[i]) / period
+
+    return adx
+
+
+def build_candles_from_deriv(candles_raw):
     out = []
-    for x in data.get("candles", []):
-        out.append({
-            "t0": int(x["epoch"]),
-            "o": float(x["open"]),
-            "h": float(x["high"]),
-            "l": float(x["low"]),
-            "c": float(x["close"]),
-            "v": float(x.get("volume", 0))  # volume may be 0 if not provided
-        })
+    for x in candles_raw:
+        out.append(
+            {
+                "t0": int(x.get("epoch", 0)),
+                "o": float(x.get("open", 0)),
+                "h": float(x.get("high", 0)),
+                "l": float(x.get("low", 0)),
+                "c": float(x.get("close", 0)),
+            }
+        )
     return out
+
 
 def fmt_time_hhmmss(epoch):
     try:
         return datetime.fromtimestamp(epoch, ZoneInfo("Africa/Lagos")).strftime("%H:%M:%S")
-    except:
+    except Exception:
         return "—"
+
 
 def fmt_hhmm(epoch):
     try:
         return datetime.fromtimestamp(epoch, ZoneInfo("Africa/Lagos")).strftime("%H:%M")
-    except:
+    except Exception:
         return "—"
+
 
 def money2(x: float) -> float:
     import math
     return math.ceil(float(x) * 100.0) / 100.0
 
+
 # ========================= BOT CORE =========================
-class DerivMultiTFBot:
+class DerivSniperBot:
     def __init__(self):
         self.api = None
         self.app = None
@@ -219,7 +281,7 @@ class DerivMultiTFBot:
         self.market_tasks = {}
 
         self.active_trade_info = None
-        self.active_market = None
+        self.active_market = "None"
         self.trade_start_time = 0.0
 
         self.cooldown_until = 0.0
@@ -242,7 +304,7 @@ class DerivMultiTFBot:
         self.trade_lock = asyncio.Lock()
 
         self.market_debug = {m: {} for m in MARKETS}
-        self.last_processed_ts = {m: {TF_1M: 0, TF_5M: 0, TF_15M: 0} for m in MARKETS}
+        self.last_processed_closed_t0 = {m: 0 for m in MARKETS}
 
         self.tz = ZoneInfo("Africa/Lagos")
         self.current_day = datetime.now(self.tz).date()
@@ -254,18 +316,23 @@ class DerivMultiTFBot:
         self._next_poll_epoch = {m: 0.0 for m in MARKETS}
         self._rate_limit_strikes = {m: 0 for m in MARKETS}
 
+        # refresh cooldown
         self.status_cooldown_until = 0.0
 
     # ---------- helpers ----------
     @staticmethod
     def _is_gatewayish_error(msg: str) -> bool:
         m = (msg or "").lower()
-        return any(k in m for k in [
-            "gateway", "bad gateway", "502", "503", "504",
-            "timeout", "timed out", "temporarily unavailable",
-            "connection", "websocket", "not connected", "disconnect",
-            "internal server error", "service unavailable"
-        ])
+        return any(
+            k in m
+            for k in [
+                "gateway", "bad gateway", "502", "503", "504",
+                "timeout", "timed out",
+                "temporarily unavailable",
+                "connection", "websocket", "not connected", "disconnect",
+                "internal server error", "service unavailable",
+            ]
+        )
 
     @staticmethod
     def _is_rate_limit_error(msg: str) -> bool:
@@ -275,16 +342,19 @@ class DerivMultiTFBot:
     async def safe_send_tg(self, text: str, retries: int = 5):
         if not self.app:
             return
-        for i in range(1, retries+1):
+        last_err = None
+        for i in range(1, retries + 1):
             try:
                 await self.app.bot.send_message(TELEGRAM_CHAT_ID, text)
                 return
             except Exception as e:
-                if self._is_gatewayish_error(str(e)):
-                    await asyncio.sleep(0.8*i + random.random()*0.4)
+                last_err = e
+                msg = str(e)
+                if self._is_gatewayish_error(msg):
+                    await asyncio.sleep(0.8 * i + random.random() * 0.4)
                 else:
-                    await asyncio.sleep(0.4*i)
-        logger.warning(f"Telegram send failed after retries")
+                    await asyncio.sleep(0.4 * i)
+        logger.warning(f"Telegram send failed after retries: {last_err}")
 
     # ---------- Sections ----------
     def _today_midnight_epoch(self) -> float:
@@ -337,7 +407,10 @@ class DerivMultiTFBot:
     async def safe_reconnect(self) -> bool:
         try:
             if self.api:
-                await self.api.disconnect()
+                try:
+                    await self.api.disconnect()
+                except Exception:
+                    pass
         except Exception:
             pass
         self.api = None
@@ -345,7 +418,7 @@ class DerivMultiTFBot:
 
     async def safe_deriv_call(self, fn_name: str, payload: dict, retries: int = 6):
         last_err = None
-        for attempt in range(1, retries+1):
+        for attempt in range(1, retries + 1):
             try:
                 if not self.api:
                     ok = await self.safe_reconnect()
@@ -359,9 +432,9 @@ class DerivMultiTFBot:
                 if self._is_gatewayish_error(msg):
                     await self.safe_reconnect()
                 if self._is_rate_limit_error(msg):
-                    await asyncio.sleep(min(20.0, 2.5*attempt + random.random()))
+                    await asyncio.sleep(min(20.0, 2.5 * attempt + random.random()))
                 else:
-                    await asyncio.sleep(min(8.0, 0.6*attempt + random.random()*0.5))
+                    await asyncio.sleep(min(8.0, 0.6 * attempt + random.random() * 0.5))
         raise last_err
 
     async def safe_ticks_history(self, payload: dict, retries: int = 4):
@@ -443,204 +516,7 @@ class DerivMultiTFBot:
             return False, "Not connected"
         return True, "OK"
 
-    # ---------- Fetch candles for a timeframe ----------
-    async def fetch_candles(self, symbol: str, tf_seconds: int, count: int):
-        payload = {
-            "ticks_history": symbol,
-            "end": "latest",
-            "count": count,
-            "style": "candles",
-            "granularity": tf_seconds,
-        }
-        data = await self.safe_ticks_history(payload, retries=4)
-        candles = build_candles(data)
-        logger.debug(f"Fetched {len(candles)} candles for {symbol} {tf_seconds}s")
-        return candles
-
-    # ---------- Core signal builder ----------
-    def evaluate_signal(self, symbol, candles_15m, candles_5m, candles_1m):
-        """Returns ('CALL', 'PUT', None) and debug dict."""
-        dbg = {}
-        # 1. 15M trend: EMA50
-        closes_15 = [c["c"] for c in candles_15m]
-        if len(closes_15) < EMA_TREND_PERIOD + 5:
-            return None, f"Not enough 15M data ({len(closes_15)})", dbg
-        ema50_15 = ema(closes_15, EMA_TREND_PERIOD)[-1]
-        price_15 = closes_15[-1]
-        trend_up = price_15 > ema50_15
-        trend_down = price_15 < ema50_15
-        dbg["trend_15m"] = "UP" if trend_up else "DOWN" if trend_down else "SIDE"
-        dbg["ema50_15"] = round(ema50_15, 5)
-
-        # Optional ADX filter
-        if USE_ADX:
-            highs_15 = [c["h"] for c in candles_15m]
-            lows_15 = [c["l"] for c in candles_15m]
-            adx_vals = adx(highs_15, lows_15, closes_15, ADX_PERIOD)
-            if len(adx_vals) > 0 and not np.isnan(adx_vals[-1]):
-                adx_val = adx_vals[-1]
-                dbg["adx"] = round(adx_val, 2)
-                if adx_val < ADX_MIN:
-                    return None, f"ADX too low ({adx_val:.1f} < {ADX_MIN})", dbg
-            else:
-                dbg["adx"] = "N/A"
-        else:
-            dbg["adx"] = "N/A"
-
-        # 2. 5M pullback to EMA20
-        closes_5 = [c["c"] for c in candles_5m]
-        if len(closes_5) < EMA_PULLBACK_PERIOD + 5:
-            return None, f"Not enough 5M data ({len(closes_5)})", dbg
-        ema20_5 = ema(closes_5, EMA_PULLBACK_PERIOD)[-1]
-        highs_5 = [c["h"] for c in candles_5m]
-        lows_5 = [c["l"] for c in candles_5m]
-        atr_vals = atr(highs_5, lows_5, closes_5, 14)
-        if len(atr_vals) < 2 or np.isnan(atr_vals[-1]):
-            return None, "ATR not ready", dbg
-        atr_5 = atr_vals[-1]
-        pullback_zone = atr_5 * PULLBACK_ATR_MULT
-
-        if len(candles_5m) < 3:
-            return None, "Not enough 5M candles", dbg
-        pb_candle = candles_5m[-2]   # last closed 5M candle
-        pb_low = pb_candle["l"]
-        pb_high = pb_candle["h"]
-        pb_open = pb_candle["o"]
-        pb_close = pb_candle["c"]
-
-        touches_zone = abs(pb_low - ema20_5) <= pullback_zone or abs(pb_high - ema20_5) <= pullback_zone
-        dbg["touches_zone"] = touches_zone
-
-        # Rejection detection
-        candle_range = pb_high - pb_low
-        if candle_range == 0:
-            return None, "Zero range candle", dbg
-        lower_wick = min(pb_open, pb_close) - pb_low
-        upper_wick = pb_high - max(pb_open, pb_close)
-        # For long: lower wick >= threshold and close sufficiently above low
-        rejection_long = (lower_wick / candle_range >= REJECTION_WICK_MIN and
-                          (pb_close - pb_low) / candle_range >= REJECTION_CLOSE_MOVE)
-        # For short: upper wick >= threshold and close sufficiently below high
-        rejection_short = (upper_wick / candle_range >= REJECTION_WICK_MIN and
-                           (pb_high - pb_close) / candle_range >= REJECTION_CLOSE_MOVE)
-        dbg["rejection_long"] = rejection_long
-        dbg["rejection_short"] = rejection_short
-
-        # 3. 1M confirmation
-        if len(candles_1m) < 20:
-            return None, "Not enough 1M data", dbg
-        conf_candle = candles_1m[-2]   # last closed 1M candle
-        conf_open = conf_candle["o"]
-        conf_close = conf_candle["c"]
-        conf_high = conf_candle["h"]
-        conf_low = conf_candle["l"]
-        conf_vol = conf_candle.get("v", 0)
-        conf_body = abs(conf_close - conf_open)
-        conf_range = conf_high - conf_low
-        if conf_range == 0:
-            return None, "Zero range candle", dbg
-        body_ratio = conf_body / conf_range
-        strong_candle = body_ratio >= MIN_BODY_RATIO
-        dbg["body_ratio"] = round(body_ratio, 2)
-        dbg["strong_candle"] = strong_candle
-
-        # Volume spike – if volume is zero (common on synthetic indices), treat as OK
-        vol_ok = True
-        if conf_vol > 0:
-            volumes = [c.get("v", 0) for c in candles_1m[-21:-1]]
-            avg_vol = sum(volumes) / len(volumes) if volumes else 0
-            vol_ok = conf_vol > avg_vol * VOLUME_MULT
-        dbg["vol_ok"] = vol_ok
-
-        # RSI on 1M closes
-        closes_1 = [c["c"] for c in candles_1m]
-        rsi_vals = rsi(closes_1, RSI_PERIOD)
-        if len(rsi_vals) < 3 or np.isnan(rsi_vals[-2]):
-            return None, "RSI not ready", dbg
-        rsi_val = rsi_vals[-2]
-        dbg["rsi"] = round(rsi_val, 2)
-
-        # 4. Combine signals
-        # CALL (long)
-        if (trend_up and touches_zone and rejection_long and
-            strong_candle and conf_close > conf_open and vol_ok and rsi_val > 50):
-            return "CALL", "All conditions met", dbg
-
-        # PUT (short)
-        if (trend_down and touches_zone and rejection_short and
-            strong_candle and conf_close < conf_open and vol_ok and rsi_val < 50):
-            return "PUT", "All conditions met", dbg
-
-        # No signal
-        reason = (f"15M: {'up' if trend_up else 'down' if trend_down else 'side'}, "
-                  f"touches: {touches_zone}, "
-                  f"rej: {'long' if rejection_long else 'short' if rejection_short else 'none'}, "
-                  f"1M: {'strong' if strong_candle else 'weak'}, vol_ok: {vol_ok}, RSI: {rsi_val:.1f}")
-        return None, reason, dbg
-
     # ---------- Scanner loop ----------
-    async def scan_market(self, symbol: str):
-        self._next_poll_epoch[symbol] = time.time() + random.random() * 0.5
-        while self.is_scanning:
-            try:
-                now = time.time()
-                nxt = self._next_poll_epoch.get(symbol, 0.0)
-                if now < nxt:
-                    await asyncio.sleep(min(1.0, nxt - now))
-                    continue
-
-                if self.consecutive_losses >= MAX_CONSEC_LOSSES or self.trades_today >= MAX_TRADES_PER_DAY:
-                    self.is_scanning = False
-                    break
-
-                ok_gate, gate = self.can_auto_trade()
-                if not ok_gate:
-                    self.market_debug[symbol] = {"time": now, "gate": gate, "signal": None, "why": [gate]}
-                    self._next_poll_epoch[symbol] = now + 5
-                    continue
-
-                # Fetch candles for all three timeframes
-                c15 = await self.fetch_candles(symbol, TF_15M, CANDLES_15M)
-                await asyncio.sleep(0.1)  # small delay between requests
-                c5 = await self.fetch_candles(symbol, TF_5M, CANDLES_5M)
-                await asyncio.sleep(0.1)
-                c1 = await self.fetch_candles(symbol, TF_1M, CANDLES_1M)
-
-                if len(c15) < 55 or len(c5) < 55 or len(c1) < 30:
-                    # Not enough data – log and try again later
-                    dbg = {
-                        "time": now,
-                        "gate": gate,
-                        "why": f"Insufficient candles: 15M:{len(c15)}, 5M:{len(c5)}, 1M:{len(c1)}",
-                        "signal": None
-                    }
-                    self.market_debug[symbol] = dbg
-                    self._next_poll_epoch[symbol] = now + 10
-                    continue
-
-                # Evaluate signal
-                signal, reason, dbg = self.evaluate_signal(symbol, c15, c5, c1)
-                dbg["time"] = now
-                dbg["gate"] = gate
-                dbg["why"] = reason
-                dbg["signal"] = signal
-                self.market_debug[symbol] = dbg
-
-                # If signal, execute trade
-                if signal:
-                    await self.execute_trade(signal, symbol, source="AUTO", rsi_now=dbg.get("rsi", 50))
-
-                # Next poll: wait until next 1M candle close (approximately)
-                next_minute = int(time.time() // 60 * 60) + 60
-                self._next_poll_epoch[symbol] = next_minute + 0.5
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Scanner Error ({symbol}): {e}")
-                self.market_debug[symbol] = {"time": time.time(), "error": str(e), "signal": None}
-                await asyncio.sleep(5)
-
     async def background_scanner(self):
         if not self.api:
             return
@@ -655,7 +531,330 @@ class DerivMultiTFBot:
                 t.cancel()
             self.market_tasks.clear()
 
-    # ========================= TRADE EXECUTION =========================
+    async def fetch_real_m1_candles(self, symbol: str):
+        payload = {
+            "ticks_history": symbol,
+            "end": "latest",
+            "count": CANDLES_COUNT,
+            "style": "candles",
+            "granularity": TF_SEC,
+        }
+        data = await self.safe_ticks_history(payload, retries=4)
+        return build_candles_from_deriv(data.get("candles", []))
+
+    async def scan_market(self, symbol: str):
+        self._next_poll_epoch[symbol] = time.time() + random.random() * 0.5
+
+        while self.is_scanning:
+            try:
+                now = time.time()
+                nxt = float(self._next_poll_epoch.get(symbol, 0.0))
+                if now < nxt:
+                    await asyncio.sleep(min(1.0, nxt - now))
+                    continue
+
+                if self.consecutive_losses >= MAX_CONSEC_LOSSES or self.trades_today >= MAX_TRADES_PER_DAY:
+                    self.is_scanning = False
+                    break
+
+                ok_gate, gate = self.can_auto_trade()
+
+                candles = await self.fetch_real_m1_candles(symbol)
+                if len(candles) < 70:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "gate": "Waiting for more candles",
+                        "why": [f"Not enough candle history yet (need ~70, have {len(candles)})."],
+                    }
+                    self._next_poll_epoch[symbol] = time.time() + 10
+                    continue
+
+                pullback = candles[-3]
+                confirm = candles[-2]
+                confirm_t0 = int(confirm["t0"])
+
+                next_closed_epoch = confirm_t0 + TF_SEC
+                self._next_poll_epoch[symbol] = float(next_closed_epoch + 0.35)
+
+                if self.last_processed_closed_t0[symbol] == confirm_t0:
+                    continue
+
+                closes = [x["c"] for x in candles]
+                highs = [x["h"] for x in candles]
+                lows = [x["l"] for x in candles]
+
+                # ===================== STRATEGY 2 IMPLEMENTATION =====================
+                ema20_arr = calculate_ema(closes, 20)
+                ema50_arr = calculate_ema(closes, EMA_PULLBACK_PERIOD)
+                ema200_arr = calculate_ema(closes, EMA_TREND_PERIOD)
+
+                if len(ema20_arr) < 60 or len(ema50_arr) < 60 or len(ema200_arr) < 60:
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "gate": "Indicators",
+                        "why": ["EMA arrays not ready yet."],
+                    }
+                    self.last_processed_closed_t0[symbol] = confirm_t0
+                    continue
+
+                ema20_pullback = float(ema20_arr[-3])
+                ema20_confirm = float(ema20_arr[-2])
+
+                ema50_pullback = float(ema50_arr[-3])
+                ema50_confirm = float(ema50_arr[-2])
+
+                ema200_confirm = float(ema200_arr[-2])
+
+                # keep variables for UI (unchanged keys)
+                slope_ok = True
+                ema50_slope = 0.0
+                ema50_rising = False
+                ema50_falling = False
+
+                # RSI
+                rsi_arr = calculate_rsi(closes, RSI_PERIOD)
+                if len(rsi_arr) < 60 or np.isnan(rsi_arr[-2]):
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "gate": "Indicators",
+                        "why": ["RSI not ready yet."],
+                    }
+                    self.last_processed_closed_t0[symbol] = confirm_t0
+                    continue
+                rsi_now = float(rsi_arr[-2])
+
+                # Stochastic
+                stoch_k, stoch_d = calculate_stochastic(
+                    highs, lows, closes,
+                    k_period=STOCH_K_PERIOD,
+                    d_period=STOCH_D_PERIOD,
+                    smooth=STOCH_SMOOTH
+                )
+                if (
+                    len(stoch_k) < 60
+                    or np.isnan(stoch_k[-2]) or np.isnan(stoch_d[-2])
+                    or np.isnan(stoch_k[-3]) or np.isnan(stoch_d[-3])
+                ):
+                    self.market_debug[symbol] = {
+                        "time": time.time(),
+                        "gate": "Indicators",
+                        "why": ["Stochastic not ready yet."],
+                    }
+                    self.last_processed_closed_t0[symbol] = confirm_t0
+                    continue
+
+                k_prev = float(stoch_k[-3])
+                d_prev = float(stoch_d[-3])
+                k_now = float(stoch_k[-2])
+                d_now = float(stoch_d[-2])
+
+                # ===== ADX + ATR (EXISTING) =====
+                atr_arr = calculate_atr(highs, lows, closes, ATR_PERIOD)
+                adx_arr = calculate_adx(highs, lows, closes, ADX_PERIOD)
+
+                atr_now = float(atr_arr[-2]) if len(atr_arr) and not np.isnan(atr_arr[-2]) else float("nan")
+                adx_now = float(adx_arr[-2]) if len(adx_arr) and not np.isnan(adx_arr[-2]) else float("nan")
+
+                atr_ok = (not np.isnan(atr_now)) and (atr_now >= float(ATR_MIN))
+                adx_ok = (not np.isnan(adx_now)) and (adx_now >= float(ADX_MIN))
+
+                if TREND_FILTER_MODE.upper() == "EITHER":
+                    trend_filter_ok = adx_ok or atr_ok
+                else:
+                    trend_filter_ok = adx_ok and atr_ok
+
+                # Pullback touches EMA50 (Strategy 2)
+                pb_high = float(pullback["h"])
+                pb_low = float(pullback["l"])
+                touched_ema50 = (pb_low <= ema50_pullback <= pb_high)
+
+                # Confirm candle data
+                c_open = float(confirm["o"])
+                c_close = float(confirm["c"])
+                bull_confirm = c_close > c_open
+                bear_confirm = c_close < c_open
+
+                close_above_ema20 = c_close > ema20_confirm
+                close_below_ema20 = c_close < ema20_confirm
+
+                # Candle strength filter (EXISTING)
+                bodies = [abs(float(candles[i]["c"]) - float(candles[i]["o"])) for i in range(-22, -2)]
+                avg_body = float(np.mean(bodies)) if len(bodies) >= 10 else float(
+                    np.mean([abs(float(c["c"]) - float(c["o"])) for c in candles[-60:-2]])
+                )
+                last_body = abs(c_close - c_open)
+
+                c_high = float(confirm["h"])
+                c_low = float(confirm["l"])
+                c_range = max(MIN_CANDLE_RANGE, c_high - c_low)
+                body_ratio = last_body / c_range
+                strong_candle = body_ratio >= float(MIN_BODY_RATIO)
+
+                # Strategy 2: body must be > previous candle body
+                pb_open = float(pullback["o"])
+                pb_close = float(pullback["c"])
+                pb_body = abs(pb_close - pb_open)
+                body_gt_prev = last_body > pb_body
+
+                # spike block (EXISTING)
+                spike_mult = 1.5
+                spike_block = (avg_body > 0 and last_body > spike_mult * avg_body)
+
+                # flat block (UPDATED to Strategy 2: EMA50 vs EMA200)
+                ema_diff_min = 0.40
+                ema_diff = abs(ema50_confirm - ema200_confirm)
+                flat_block = ema_diff < ema_diff_min
+
+                # Strategy 2 Trend filter: EMA50 aligned with EMA200 + price on correct side
+                trend_up = (ema50_confirm > ema200_confirm) and (c_close > ema200_confirm)
+                trend_down = (ema50_confirm < ema200_confirm) and (c_close < ema200_confirm)
+
+                # Strategy 2 Stochastic turning rules
+                stoch_turn_up = (
+                    (k_prev <= STOCH_OVERSOLD)
+                    and (k_now > k_prev)
+                    and (k_now > d_now)
+                    and (k_prev <= d_prev)
+                )
+                stoch_turn_down = (
+                    (k_prev >= STOCH_OVERBOUGHT)
+                    and (k_now < k_prev)
+                    and (k_now < d_now)
+                    and (k_prev >= d_prev)
+                )
+
+                # Strategy 2: next candle open confirmation (enter at next candle open)
+                # candles[-1] is the currently forming candle after confirm close (its "o" is stable)
+                next_open = float(candles[-1]["o"]) if len(candles) >= 1 else float("nan")
+                next_open_above_ema50 = (not np.isnan(next_open)) and (next_open > ema50_confirm)
+                next_open_below_ema50 = (not np.isnan(next_open)) and (next_open < ema50_confirm)
+
+                # Strategy 2 RSI rules (binary-optimized)
+                call_rsi_ok = rsi_now >= RSI_CALL_MIN
+                put_rsi_ok = rsi_now <= RSI_PUT_MAX
+
+                # Final Strategy 2 signals
+                call_ready = (
+                    trend_up
+                    and touched_ema50
+                    and bull_confirm
+                    and strong_candle
+                    and body_gt_prev
+                    and call_rsi_ok
+                    and stoch_turn_up
+                    and next_open_above_ema50
+                    and not spike_block
+                    and not flat_block
+                    and trend_filter_ok
+                )
+                put_ready = (
+                    trend_down
+                    and touched_ema50
+                    and bear_confirm
+                    and strong_candle
+                    and body_gt_prev
+                    and put_rsi_ok
+                    and stoch_turn_down
+                    and next_open_below_ema50
+                    and not spike_block
+                    and not flat_block
+                    and trend_filter_ok
+                )
+
+                signal = "CALL" if call_ready else "PUT" if put_ready else None
+
+                # ---------- labels for your STATUS UI (kept same keys) ----------
+                trend_label = "UPTREND" if trend_up else "DOWNTREND" if trend_down else "SIDEWAYS"
+                ema_label = "EMA50 ABOVE EMA200" if trend_up else "EMA50 BELOW EMA200" if trend_down else "EMA50 ~ EMA200"
+                trend_strength = "STRONG" if not flat_block else "WEAK"
+                pullback_label = "PULLBACK EMA50 ✅" if touched_ema50 else "WAITING EMA50 PULLBACK…"
+                confirm_close_label = (
+                    "CONFIRM BULL ✅" if bull_confirm else
+                    "CONFIRM BEAR ✅" if bear_confirm else
+                    "CONFIRM DOJI/FLAT"
+                )
+                slope_label = "—"
+
+                block_label_parts = []
+                if spike_block:
+                    block_label_parts.append("SPIKE BLOCK")
+                if flat_block:
+                    block_label_parts.append("WEAK/FLAT TREND")
+                if not strong_candle:
+                    block_label_parts.append("WEAK CANDLE")
+                if not body_gt_prev:
+                    block_label_parts.append("BODY<=PREV")
+                if not adx_ok:
+                    block_label_parts.append("ADX LOW")
+                if not atr_ok:
+                    block_label_parts.append("ATR LOW")
+                if not trend_filter_ok:
+                    block_label_parts.append("TREND FILTER FAIL")
+
+                block_label = " | ".join(block_label_parts) if block_label_parts else "OK"
+
+                why = []
+                if not ok_gate:
+                    why.append(f"Gate blocked: {gate}")
+                if signal:
+                    why.append(f"READY: {signal} (enter next candle)")
+                else:
+                    why.append("No entry yet (conditions not aligned).")
+
+                self.market_debug[symbol] = {
+                    "time": time.time(),
+                    "gate": gate,
+                    "last_closed": confirm_t0,
+                    "signal": signal,
+
+                    "trend_label": trend_label,
+                    "ema_label": ema_label,
+                    "trend_strength": trend_strength,
+                    "pullback_label": pullback_label,
+                    "confirm_close_label": confirm_close_label,
+                    "slope_label": slope_label,
+                    "block_label": block_label,
+
+                    "ema50_slope": ema50_slope,
+                    "rsi_now": rsi_now,
+                    "body_ratio": body_ratio,
+
+                    "adx_now": adx_now,
+                    "atr_now": atr_now,
+                    "adx_ok": adx_ok,
+                    "atr_ok": atr_ok,
+                    "trend_filter_ok": trend_filter_ok,
+
+                    "why": why[:10],
+                }
+
+                self.last_processed_closed_t0[symbol] = confirm_t0
+
+                if not ok_gate:
+                    continue
+
+                if call_ready:
+                    await self.execute_trade("CALL", symbol, source="AUTO", rsi_now=rsi_now, ema50_slope=ema50_slope)
+                elif put_ready:
+                    await self.execute_trade("PUT", symbol, source="AUTO", rsi_now=rsi_now, ema50_slope=ema50_slope)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                msg = str(e)
+                logger.error(f"Scanner Error ({symbol}): {msg}")
+
+                if self._is_rate_limit_error(msg):
+                    self._rate_limit_strikes[symbol] = int(self._rate_limit_strikes.get(symbol, 0)) + 1
+                    backoff = RATE_LIMIT_BACKOFF_BASE * self._rate_limit_strikes[symbol]
+                    backoff = min(180, backoff)
+                    self._next_poll_epoch[symbol] = time.time() + backoff
+                else:
+                    await asyncio.sleep(2 if not self._is_gatewayish_error(msg) else 5)
+
+            await asyncio.sleep(0.05)
+
+    # ========================= PAYOUT MODE + MARTINGALE =========================
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL",
                             rsi_now: float = 0.0, ema50_slope: float = 0.0):
         if not self.api or self.active_trade_info:
@@ -668,13 +867,18 @@ class DerivMultiTFBot:
 
             try:
                 import math
-                payout = float(DAILY_PROFIT_TARGET) * (MARTINGALE_MULT ** self.martingale_step)
+
+                payout = float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step))
                 payout = money2(payout)
-                payout = max(0.01, payout)
+
+                payout = max(0.01, float(payout))
                 if not math.isfinite(payout):
                     payout = 0.01
-                payout = max(0.35, payout)
+
+                payout = max(float(MIN_PAYOUT), float(payout))
                 payout = money2(payout)
+
+                # ✅ BALANCE PROTECTION REMOVED (this was the limiter)
 
                 proposal_req = {
                     "proposal": 1,
@@ -682,7 +886,7 @@ class DerivMultiTFBot:
                     "basis": "payout",
                     "contract_type": side,
                     "currency": "USD",
-                    "duration": DURATION_MIN,
+                    "duration": int(DURATION_MIN),
                     "duration_unit": "m",
                     "symbol": symbol,
                 }
@@ -700,14 +904,16 @@ class DerivMultiTFBot:
                     await self.safe_send_tg("❌ Proposal returned invalid ask_price.")
                     return
 
-                if ask_price > MAX_STAKE_ALLOWED:
+                if ask_price > float(MAX_STAKE_ALLOWED):
                     await self.safe_send_tg(
                         f"⛔️ Skipped trade: payout=${payout:.2f} needs stake=${ask_price:.2f} > max ${MAX_STAKE_ALLOWED:.2f}"
                     )
                     self.cooldown_until = time.time() + COOLDOWN_SEC
                     return
 
-                buy = await self.safe_deriv_call("buy", {"buy": proposal_id, "price": ask_price}, retries=6)
+                buy_price_cap = float(MAX_STAKE_ALLOWED)
+
+                buy = await self.safe_deriv_call("buy", {"buy": proposal_id, "price": buy_price_cap}, retries=6)
                 if "error" in buy:
                     err_msg = str(buy["error"].get("message", "Buy error"))
                     await self.safe_send_tg(f"❌ Trade Refused:\n{err_msg}")
@@ -741,7 +947,7 @@ class DerivMultiTFBot:
                 await self.safe_send_tg(f"⚠️ Trade error:\n{e}")
 
     async def check_result(self, cid: int, source: str, side: str, rsi_now: float, ema50_slope: float):
-        await asyncio.sleep(DURATION_MIN * 60 + 5)
+        await asyncio.sleep(int(DURATION_MIN) * 60 + 5)
         try:
             res = await self.safe_deriv_call(
                 "proposal_open_contract",
@@ -754,7 +960,7 @@ class DerivMultiTFBot:
                 self.total_profit_today += profit
                 self.section_profit += profit
 
-                if self.section_profit >= SECTION_PROFIT_TARGET:
+                if self.section_profit >= float(SECTION_PROFIT_TARGET):
                     self.sections_won_today += 1
                     self.section_pause_until = self._next_section_start_epoch(time.time())
 
@@ -786,7 +992,7 @@ class DerivMultiTFBot:
                 else ""
             )
 
-            next_payout = money2(DAILY_PROFIT_TARGET * (MARTINGALE_MULT ** self.martingale_step))
+            next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(self.martingale_step)))
 
             await self.safe_send_tg(
                 (
@@ -803,8 +1009,10 @@ class DerivMultiTFBot:
             self.active_trade_info = None
             self.cooldown_until = time.time() + COOLDOWN_SEC
 
+
 # ========================= UI =========================
-bot_logic = DerivMultiTFBot()
+bot_logic = DerivSniperBot()
+
 
 def main_keyboard():
     return InlineKeyboardMarkup(
@@ -826,46 +1034,85 @@ def main_keyboard():
         ]
     )
 
+
 def format_market_detail(sym: str, d: dict) -> str:
     if not d:
         return f"📍 {sym.replace('_',' ')}\n⏳ No scan data yet"
+
     age = int(time.time() - d.get("time", time.time()))
     gate = d.get("gate", "—")
+    last_closed = d.get("last_closed", 0)
     signal = d.get("signal") or "—"
-    why = d.get("why", "")
-    adx = d.get("adx", "—")
-    rsi = d.get("rsi", "—")
-    body_ratio = d.get("body_ratio", "—")
-    touches_zone = d.get("touches_zone", False)
-    rejection_long = d.get("rejection_long", False)
-    rejection_short = d.get("rejection_short", False)
-    strong_candle = d.get("strong_candle", False)
-    vol_ok = d.get("vol_ok", False)
 
-    lines = [
-        f"📍 {sym.replace('_',' ')} ({age}s)",
-        f"Gate: {gate}",
-        f"ADX: {adx} | RSI: {rsi}",
-        f"Body: {body_ratio} | Vol spike: {'✅' if vol_ok else '❌'}",
-        f"Touches zone: {'✅' if touches_zone else '❌'}",
-        f"Rejection: {'LONG' if rejection_long else 'SHORT' if rejection_short else '—'}",
-        f"Strong candle: {'✅' if strong_candle else '❌'}",
-        f"Signal: {signal}",
-        f"{why[:100]}"
-    ]
-    return "\n".join(lines)
+    trend_label = d.get("trend_label", "—")
+    ema_label = d.get("ema_label", "—")
+    trend_strength = d.get("trend_strength", "—")
+    pullback_label = d.get("pullback_label", "—")
+    confirm_close_label = d.get("confirm_close_label", "—")
+    slope_label = d.get("slope_label", "—")
+    block_label = d.get("block_label", "—")
 
+    rsi_now = d.get("rsi_now", None)
+    ema50_slope = d.get("ema50_slope", None)
+    body_ratio = d.get("body_ratio", None)
+
+    adx_now = d.get("adx_now", None)
+    atr_now = d.get("atr_now", None)
+    adx_ok = d.get("adx_ok", False)
+    atr_ok = d.get("atr_ok", False)
+
+    adx_line = "ADX: —"
+    atr_line = "ATR: —"
+    if isinstance(adx_now, (int, float)) and not np.isnan(adx_now):
+        adx_line = f"ADX: {adx_now:.2f} {'✅' if adx_ok else '❌'} (min {ADX_MIN})"
+    if isinstance(atr_now, (int, float)) and not np.isnan(atr_now):
+        atr_line = f"ATR: {atr_now:.5f} {'✅' if atr_ok else '❌'} (min {ATR_MIN})"
+
+    extra = []
+    if isinstance(rsi_now, (int, float)) and not np.isnan(rsi_now):
+        extra.append(f"RSI: {rsi_now:.2f}")
+    if isinstance(ema50_slope, (int, float)) and not np.isnan(ema50_slope):
+        extra.append(f"EMA50 slope: {ema50_slope:.3f}")
+    if isinstance(body_ratio, (int, float)) and not np.isnan(body_ratio):
+        extra.append(f"Body ratio: {body_ratio:.2f}")
+    extra_line = " | ".join(extra) if extra else "—"
+
+    why = d.get("why", [])
+    why_line = "Why: " + (str(why[0]) if why else "—")
+
+    return (
+        f"📍 {sym.replace('_',' ')} ({age}s)\n"
+        f"Gate: {gate}\n"
+        f"Last closed: {fmt_time_hhmmss(last_closed)}\n"
+        f"────────────────\n"
+        f"Trend: {trend_label} ({trend_strength})\n"
+        f"{ema_label}\n"
+        f"{slope_label}\n"
+        f"{pullback_label}\n"
+        f"{confirm_close_label}\n"
+        f"{adx_line}\n"
+        f"{atr_line}\n"
+        f"Stats: {extra_line}\n"
+        f"Filters: {block_label}\n"
+        f"Signal: {signal}\n"
+        f"{why_line}\n"
+    )
+
+
+# ========================= FIX: CALLBACK "query too old" =========================
 async def _safe_answer(q, text: str | None = None, show_alert: bool = False):
     try:
         await q.answer(text=text, show_alert=show_alert)
     except Exception as e:
         logger.warning(f"Callback answer ignored: {e}")
 
+
 async def _safe_edit(q, text: str, reply_markup=None):
     try:
         await q.edit_message_text(text, reply_markup=reply_markup)
     except Exception as e:
         logger.warning(f"Edit failed: {e}")
+
 
 async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
@@ -915,8 +1162,8 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         )
 
     elif q.data == "TEST_BUY":
-        asyncio.create_task(bot_logic.execute_trade("CALL", "R_75", "Manual Test", source="MANUAL"))
-        await _safe_edit(q, "🧪 Test trade triggered (CALL R_75).", reply_markup=main_keyboard())
+        asyncio.create_task(bot_logic.execute_trade("CALL", "R_10", "Manual Test", source="MANUAL"))
+        await _safe_edit(q, "🧪 Test trade triggered (CALL R 10).", reply_markup=main_keyboard())
 
     elif q.data == "STATUS":
         now = time.time()
@@ -949,7 +1196,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         pause_line = "⏸ Paused until 12:00am WAT\n" if time.time() < bot_logic.pause_until else ""
         section_line = f"🧩 Section paused until {fmt_hhmm(bot_logic.section_pause_until)}\n" if time.time() < bot_logic.section_pause_until else ""
 
-        next_payout = money2(DAILY_PROFIT_TARGET * (MARTINGALE_MULT ** bot_logic.martingale_step))
+        next_payout = money2(float(PAYOUT_TARGET) * (float(MARTINGALE_MULT) ** int(bot_logic.martingale_step)))
 
         header = (
             f"🕒 Time (WAT): {now_time}\n"
@@ -961,6 +1208,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"⏱ Expiry: {DURATION_MIN}m | Cooldown: {COOLDOWN_SEC}s\n"
             f"🎯 Daily Target: +${DAILY_PROFIT_TARGET:.2f}\n"
             f"📡 Markets: {', '.join(MARKETS).replace('_',' ')}\n"
+            f"📌 Trend Filters: ADX(min {ADX_MIN}) + ATR(min {ATR_MIN}) | Mode: {TREND_FILTER_MODE}\n"
             f"━━━━━━━━━━━━━━━\n{trade_status}\n━━━━━━━━━━━━━━━\n"
             f"💵 Total Profit Today: {bot_logic.total_profit_today:+.2f}\n"
             f"🎯 Trades: {bot_logic.trades_today}/{MAX_TRADES_PER_DAY} | ❌ Losses: {bot_logic.total_losses_today}\n"
@@ -975,15 +1223,15 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         await _safe_edit(q, header + details, reply_markup=main_keyboard())
 
+
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        "💎 Deriv Multi-Timeframe Bot\n"
-        f"🕯 Timeframes: 15M (EMA50) → 5M (EMA20 pullback) → 1M (entry)\n"
-        f"⏱ Expiry: {DURATION_MIN}m\n"
-        "✅ Strong trend + pullback + volume (optional) + RSI confirmation\n"
-        "✅ Anti-rate-limit enabled\n",
+        "💎 Deriv Bot\n"
+        f"🕯 Timeframe: M1 | ⏱ Expiry: {DURATION_MIN}m\n"
+        "✅ Anti-rate-limit enabled (ticks_history once/minute per market)\n",
         reply_markup=main_keyboard(),
     )
+
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()

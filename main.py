@@ -1,6 +1,12 @@
-# ⚠️ SECURITY NOTE:
-# Do NOT post your Deriv / Telegram tokens publicly.
-# Paste them only on your local machine.
+"""
+Deriv Multi-Timeframe Bot – 15M EMA50 trend + 5M EMA20 pullback + 1M entry
+- Fetches 15M, 5M, 1M candles
+- Uses EMA50 on 15M for trend
+- Uses EMA20 on 5M for pullback, with ATR zone and rejection candle
+- 1M confirmation: strong candle (body ≥ 50%) + volume spike (optional) + RSI >50 (CALL) or <50 (PUT)
+- Martingale, sections, daily limits unchanged
+- Paper mode (DEMO) enabled by default
+"""
 
 import asyncio
 import logging
@@ -19,14 +25,14 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
 
-# Use a single synthetic index for now (you can add more)
-MARKETS = ["R_75", "R_100"]   # Volatility 75 and 100
+# Synthetic indices – you can add more, but start with these
+MARKETS = ["R_75", "R_100"]
 
 COOLDOWN_SEC = 120
 MAX_TRADES_PER_DAY = 60
 MAX_CONSEC_LOSSES = 10
 
-# Telegram token from crypto bot
+# Telegram token from crypto bot (already yours)
 TELEGRAM_TOKEN = "8697638086:AAG00D0RXUAqXFTjy8-4XO4Bka2kBamo-VA"
 TELEGRAM_CHAT_ID = "7634818949"
 
@@ -41,9 +47,9 @@ TF_15M = 15 * 60
 TF_5M = 5 * 60
 TF_1M = 60
 
-CANDLES_15M = 100   # enough for EMA50 and ADX
-CANDLES_5M = 100
-CANDLES_1M = 100
+CANDLES_15M = 150   # more than enough for EMA50
+CANDLES_5M = 150
+CANDLES_1M = 150
 
 # EMA periods
 EMA_TREND_PERIOD = 50     # 15M EMA50
@@ -52,16 +58,17 @@ EMA_PULLBACK_PERIOD = 20  # 5M EMA20
 # Pullback zone multiplier (ATR)
 PULLBACK_ATR_MULT = 0.75
 
-# Rejection candle threshold: wick must be at least this fraction of total range
+# Rejection candle threshold (percentage of candle range)
 REJECTION_WICK_MIN = 0.3
 REJECTION_CLOSE_MOVE = 0.2   # close must be this fraction of range away from wick
 
 # Entry confirmation
 MIN_BODY_RATIO = 0.50
 VOLUME_MULT = 1.2
-RSI_PERIOD = 7       # short period for quick momentum
+RSI_PERIOD = 7
 
-# ADX filter (optional)
+# ADX filter – optional (set to False to disable)
+USE_ADX = False
 ADX_PERIOD = 14
 ADX_MIN = 25.0
 
@@ -84,6 +91,7 @@ STATUS_REFRESH_COOLDOWN_SEC = 10
 
 # ========================= INDICATOR HELPERS =========================
 def ema(values, period):
+    """Exponential moving average."""
     values = np.array(values, dtype=float)
     if len(values) < period:
         return np.array([])
@@ -95,6 +103,7 @@ def ema(values, period):
     return ema
 
 def rsi(values, period=14):
+    """Relative Strength Index."""
     values = np.array(values, dtype=float)
     n = len(values)
     if n < period + 2:
@@ -117,6 +126,7 @@ def rsi(values, period=14):
     return rsi_arr
 
 def atr(highs, lows, closes, period=14):
+    """Average True Range."""
     n = len(closes)
     if n < period + 1:
         return np.array([])
@@ -132,11 +142,7 @@ def atr(highs, lows, closes, period=14):
     return atr_arr
 
 def adx(highs, lows, closes, period=14):
-    # Simplified ADX; returns the last value or None
-    # (full implementation from original code can be reused, but we'll keep it simple for now)
-    # For brevity, we'll just compute using the existing function; but to avoid duplicating, we can use a simpler version.
-    # Since the original code had a full ADX, we'll use that.
-    # We'll import the existing function from the original code? But we're rewriting. Let's include a minimal ADX.
+    """Average Directional Index."""
     n = len(closes)
     if n < period * 2 + 2:
         return np.array([])
@@ -171,7 +177,7 @@ def adx(highs, lows, closes, period=14):
     return adx_arr
 
 def build_candles(data):
-    """Convert ticks_history candles to list of dicts."""
+    """Convert ticks_history candles to list of dicts with optional volume."""
     out = []
     for x in data.get("candles", []):
         out.append({
@@ -180,7 +186,7 @@ def build_candles(data):
             "h": float(x["high"]),
             "l": float(x["low"]),
             "c": float(x["close"]),
-            "v": float(x.get("volume", 0))
+            "v": float(x.get("volume", 0))  # volume may be 0 if not provided
         })
     return out
 
@@ -447,17 +453,18 @@ class DerivMultiTFBot:
             "granularity": tf_seconds,
         }
         data = await self.safe_ticks_history(payload, retries=4)
-        return build_candles(data)
+        candles = build_candles(data)
+        logger.debug(f"Fetched {len(candles)} candles for {symbol} {tf_seconds}s")
+        return candles
 
     # ---------- Core signal builder ----------
     def evaluate_signal(self, symbol, candles_15m, candles_5m, candles_1m):
-        """Returns 'CALL', 'PUT', or None with debug info."""
+        """Returns ('CALL', 'PUT', None) and debug dict."""
         dbg = {}
-
         # 1. 15M trend: EMA50
         closes_15 = [c["c"] for c in candles_15m]
         if len(closes_15) < EMA_TREND_PERIOD + 5:
-            return None, "Not enough 15M data", dbg
+            return None, f"Not enough 15M data ({len(closes_15)})", dbg
         ema50_15 = ema(closes_15, EMA_TREND_PERIOD)[-1]
         price_15 = closes_15[-1]
         trend_up = price_15 > ema50_15
@@ -465,8 +472,8 @@ class DerivMultiTFBot:
         dbg["trend_15m"] = "UP" if trend_up else "DOWN" if trend_down else "SIDE"
         dbg["ema50_15"] = round(ema50_15, 5)
 
-        # ADX on 15M (optional, but adds strength)
-        if len(candles_15m) > ADX_PERIOD*2:
+        # Optional ADX filter
+        if USE_ADX:
             highs_15 = [c["h"] for c in candles_15m]
             lows_15 = [c["l"] for c in candles_15m]
             adx_vals = adx(highs_15, lows_15, closes_15, ADX_PERIOD)
@@ -477,13 +484,14 @@ class DerivMultiTFBot:
                     return None, f"ADX too low ({adx_val:.1f} < {ADX_MIN})", dbg
             else:
                 dbg["adx"] = "N/A"
+        else:
+            dbg["adx"] = "N/A"
 
         # 2. 5M pullback to EMA20
         closes_5 = [c["c"] for c in candles_5m]
         if len(closes_5) < EMA_PULLBACK_PERIOD + 5:
-            return None, "Not enough 5M data", dbg
+            return None, f"Not enough 5M data ({len(closes_5)})", dbg
         ema20_5 = ema(closes_5, EMA_PULLBACK_PERIOD)[-1]
-        # ATR for volatility zone
         highs_5 = [c["h"] for c in candles_5m]
         lows_5 = [c["l"] for c in candles_5m]
         atr_vals = atr(highs_5, lows_5, closes_5, 14)
@@ -492,28 +500,27 @@ class DerivMultiTFBot:
         atr_5 = atr_vals[-1]
         pullback_zone = atr_5 * PULLBACK_ATR_MULT
 
-        # Last closed 5M candle (index -2 because last is forming)
         if len(candles_5m) < 3:
             return None, "Not enough 5M candles", dbg
-        pb_candle = candles_5m[-2]
+        pb_candle = candles_5m[-2]   # last closed 5M candle
         pb_low = pb_candle["l"]
         pb_high = pb_candle["h"]
-        pb_close = pb_candle["c"]
         pb_open = pb_candle["o"]
+        pb_close = pb_candle["c"]
 
-        # Check if price touched the EMA20 zone
         touches_zone = abs(pb_low - ema20_5) <= pullback_zone or abs(pb_high - ema20_5) <= pullback_zone
         dbg["touches_zone"] = touches_zone
 
         # Rejection detection
-        # For long: lower wick touches zone and close is above the wick by at least REJECTION_CLOSE_MOVE fraction of candle range
         candle_range = pb_high - pb_low
         if candle_range == 0:
             return None, "Zero range candle", dbg
         lower_wick = min(pb_open, pb_close) - pb_low
         upper_wick = pb_high - max(pb_open, pb_close)
+        # For long: lower wick >= threshold and close sufficiently above low
         rejection_long = (lower_wick / candle_range >= REJECTION_WICK_MIN and
                           (pb_close - pb_low) / candle_range >= REJECTION_CLOSE_MOVE)
+        # For short: upper wick >= threshold and close sufficiently below high
         rejection_short = (upper_wick / candle_range >= REJECTION_WICK_MIN and
                            (pb_high - pb_close) / candle_range >= REJECTION_CLOSE_MOVE)
         dbg["rejection_long"] = rejection_long
@@ -537,13 +544,15 @@ class DerivMultiTFBot:
         dbg["body_ratio"] = round(body_ratio, 2)
         dbg["strong_candle"] = strong_candle
 
-        # Volume spike
-        volumes = [c.get("v", 0) for c in candles_1m[-21:-1]]
-        avg_vol = sum(volumes) / len(volumes) if volumes else 0
-        vol_ok = conf_vol > avg_vol * VOLUME_MULT
+        # Volume spike – if volume is zero (common on synthetic indices), treat as OK
+        vol_ok = True
+        if conf_vol > 0:
+            volumes = [c.get("v", 0) for c in candles_1m[-21:-1]]
+            avg_vol = sum(volumes) / len(volumes) if volumes else 0
+            vol_ok = conf_vol > avg_vol * VOLUME_MULT
         dbg["vol_ok"] = vol_ok
 
-        # RSI on 1M closes (short period)
+        # RSI on 1M closes
         closes_1 = [c["c"] for c in candles_1m]
         rsi_vals = rsi(closes_1, RSI_PERIOD)
         if len(rsi_vals) < 3 or np.isnan(rsi_vals[-2]):
@@ -552,29 +561,21 @@ class DerivMultiTFBot:
         dbg["rsi"] = round(rsi_val, 2)
 
         # 4. Combine signals
-        # CALL (long) conditions:
-        # - 15M uptrend
-        # - 5M price touched EMA20 zone
-        # - 5M rejection long candle
-        # - 1M strong bullish candle, volume spike, RSI > 50
+        # CALL (long)
         if (trend_up and touches_zone and rejection_long and
             strong_candle and conf_close > conf_open and vol_ok and rsi_val > 50):
             return "CALL", "All conditions met", dbg
 
-        # PUT (short) conditions:
-        # - 15M downtrend
-        # - 5M price touched EMA20 zone
-        # - 5M rejection short candle
-        # - 1M strong bearish candle, volume spike, RSI < 50
+        # PUT (short)
         if (trend_down and touches_zone and rejection_short and
             strong_candle and conf_close < conf_open and vol_ok and rsi_val < 50):
             return "PUT", "All conditions met", dbg
 
         # No signal
-        reason = f"15M trend: {'up' if trend_up else 'down' if trend_down else 'side'}, "
-        reason += f"touches zone: {touches_zone}, "
-        reason += f"rejection: {'long' if rejection_long else 'short' if rejection_short else 'none'}, "
-        reason += f"1M: {'strong' if strong_candle else 'weak'}, vol_ok: {vol_ok}, RSI: {rsi_val:.1f}"
+        reason = (f"15M: {'up' if trend_up else 'down' if trend_down else 'side'}, "
+                  f"touches: {touches_zone}, "
+                  f"rej: {'long' if rejection_long else 'short' if rejection_short else 'none'}, "
+                  f"1M: {'strong' if strong_candle else 'weak'}, vol_ok: {vol_ok}, RSI: {rsi_val:.1f}")
         return None, reason, dbg
 
     # ---------- Scanner loop ----------
@@ -605,8 +606,15 @@ class DerivMultiTFBot:
                 await asyncio.sleep(0.1)
                 c1 = await self.fetch_candles(symbol, TF_1M, CANDLES_1M)
 
-                if not c15 or not c5 or not c1:
-                    self.market_debug[symbol] = {"time": now, "gate": gate, "signal": None, "why": ["Missing candles"]}
+                if len(c15) < 55 or len(c5) < 55 or len(c1) < 30:
+                    # Not enough data – log and try again later
+                    dbg = {
+                        "time": now,
+                        "gate": gate,
+                        "why": f"Insufficient candles: 15M:{len(c15)}, 5M:{len(c5)}, 1M:{len(c1)}",
+                        "signal": None
+                    }
+                    self.market_debug[symbol] = dbg
                     self._next_poll_epoch[symbol] = now + 10
                     continue
 
@@ -623,7 +631,6 @@ class DerivMultiTFBot:
                     await self.execute_trade(signal, symbol, source="AUTO", rsi_now=dbg.get("rsi", 50))
 
                 # Next poll: wait until next 1M candle close (approximately)
-                # We'll schedule at the start of the next minute
                 next_minute = int(time.time() // 60 * 60) + 60
                 self._next_poll_epoch[symbol] = next_minute + 0.5
 
@@ -648,7 +655,7 @@ class DerivMultiTFBot:
                 t.cancel()
             self.market_tasks.clear()
 
-    # ========================= TRADE EXECUTION (unchanged from original) =========================
+    # ========================= TRADE EXECUTION =========================
     async def execute_trade(self, side: str, symbol: str, reason="MANUAL", source="MANUAL",
                             rsi_now: float = 0.0, ema50_slope: float = 0.0):
         if not self.api or self.active_trade_info:
@@ -971,9 +978,9 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         "💎 Deriv Multi-Timeframe Bot\n"
-        f"🕯 Timeframes: 15M (EMA50) → 5M (pullback) → 1M (entry)\n"
+        f"🕯 Timeframes: 15M (EMA50) → 5M (EMA20 pullback) → 1M (entry)\n"
         f"⏱ Expiry: {DURATION_MIN}m\n"
-        "✅ Strong trend + pullback + volume + RSI confirmation\n"
+        "✅ Strong trend + pullback + volume (optional) + RSI confirmation\n"
         "✅ Anti-rate-limit enabled\n",
         reply_markup=main_keyboard(),
     )

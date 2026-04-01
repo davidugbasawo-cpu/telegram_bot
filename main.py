@@ -66,12 +66,12 @@ MIN_BODY_RATIO = 0.32
 MIN_CANDLE_RANGE = 1e-6
 
 # ========================= DAILY TARGETS / LIMITS =========================
-DAILY_PROFIT_TARGET = 10.0
+DAILY_PROFIT_TARGET = 0.98
 
 # ========================= SECTIONS =========================
 # ✅ One section per day, STOP when +$3 reached
 SECTIONS_PER_DAY = 1
-SECTION_PROFIT_TARGET = 3.0
+SECTION_PROFIT_TARGET = 0.98
 SECTION_LENGTH_SEC = int(24 * 60 * 60 / SECTIONS_PER_DAY)
 
 # ========================= PAYOUT MODE =========================
@@ -82,8 +82,8 @@ MAX_STAKE_ALLOWED = 10.00
 
 # ========================= MARTINGALE SETTINGS =========================
 # ✅ DO NOT TOUCH (as you requested)
-MARTINGALE_MULT = 2
-MARTINGALE_MAX_STEPS = 4
+MARTINGALE_MULT = 1.90
+MARTINGALE_MAX_STEPS = 5
 MARTINGALE_MAX_STAKE = 16.0
 
 # ========================= ENTRY QUALITY TOGGLES =========================

@@ -23,7 +23,7 @@ REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
 
 # ✅ trade all markets (edit freely)
-MARKETS = ["R_50", "R_75", "R_100", "R_10"]
+MARKETS = ["R_50","R_100"]
 
 # ✅ cooldown
 COOLDOWN_SEC = 3

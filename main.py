@@ -22,8 +22,8 @@ DEMO_TOKEN = "tIrfitLjqeBxCOM"
 REAL_TOKEN = "ZkOFWOlPtwnjqTS"
 APP_ID = 1089
 
-# ✅ trade all markets (edit freely)
-MARKETS = ["R_50","R_100"]
+# ✅ trade forex pairs (edit freely)
+MARKETS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CHF"]
 
 # ✅ cooldown
 COOLDOWN_SEC = 3
@@ -31,7 +31,7 @@ MAX_TRADES_PER_DAY = 80
 MAX_CONSEC_LOSSES = 10
 
 # ✅ KEEP YOUR TELEGRAM TOKEN ON YOUR PC ONLY (PASTE HERE LOCALLY)
-TELEGRAM_TOKEN = "8697638086:AAG00D0RXUAqXFTjy8-4XO4Bka2kBamo-VA"   # <-- changed to crypto token
+TELEGRAM_TOKEN = "8697638086:AAG00D0RXUAqXFTjy8-4XO4Bka2kBamo-VA"
 TELEGRAM_CHAT_ID = "7634818949"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -81,7 +81,6 @@ MIN_PAYOUT = 0.35
 MAX_STAKE_ALLOWED = 10.00
 
 # ========================= MARTINGALE SETTINGS =========================
-# ✅ DO NOT TOUCH (as you requested)
 MARTINGALE_MULT = 1.90
 MARTINGALE_MAX_STEPS = 5
 MARTINGALE_MAX_STAKE = 16.0
@@ -1115,7 +1114,7 @@ async def btn_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     elif q.data == "TEST_BUY":
         # test buy uses first market in list
-        test_symbol = MARKETS[0] if MARKETS else "R_10"
+        test_symbol = MARKETS[0] if MARKETS else "EUR/USD"
         asyncio.create_task(bot_logic.execute_trade("CALL", test_symbol, "Manual Test", source="MANUAL"))
         await _safe_edit(q, f"🧪 Test trade triggered (CALL {test_symbol.replace('_',' ')}).", reply_markup=main_keyboard())
 
